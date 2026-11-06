@@ -4,6 +4,7 @@ const KIND_MESSAGE = 9;
 const KIND_REACTION = 7;
 const KIND_DELETE = 5;
 const CHUNK = 50;
+const READ_LIMIT = 500;
 
 export interface Session {
   read(filters: unknown[], options?: { signal?: AbortSignal }): Promise<Event[]>;
@@ -64,7 +65,8 @@ export class Relay {
   }
 
   async query(filters: unknown[]): Promise<Event[]> {
-    return [...(await this.session.read(filters))];
+    const bounded = filters.map((filter: any) => ({ ...filter, limit: Math.max(1, Math.min(READ_LIMIT, filter.limit ?? READ_LIMIT)) }));
+    return [...(await this.session.read(bounded))];
   }
 
   async byIds(ids: string[]): Promise<Event[]> {
@@ -117,9 +119,22 @@ export class Relay {
     return this.query([{ kinds: [KIND_MESSAGE], authors: [this.pubkey], "#e": rootIds, limit: 200 }]);
   }
 
-  async allReactions(channelIds: string[], limit = 1000): Promise<Event[]> {
-    const filters = chunk(channelIds, CHUNK).map((ids) => ({ kinds: [KIND_REACTION], "#h": ids, limit }));
-    return filters.length ? this.query(filters) : [];
+  async allReactions(channelIds: string[], total = 1000): Promise<Event[]> {
+    const pages = await Promise.all(
+      chunk(channelIds, CHUNK).map(async (ids) => {
+        const found = new Map<string, Event>();
+        let until: number | undefined;
+        while (found.size < total) {
+          const page = await this.query([{ kinds: [KIND_REACTION], "#h": ids, limit: READ_LIMIT, ...(until ? { until } : {}) }]);
+          const before = found.size;
+          for (const event of page) found.set(event.id, event);
+          if (page.length < READ_LIMIT || found.size === before) break;
+          until = Math.min(...page.map((e) => e.created_at));
+        }
+        return [...found.values()];
+      }),
+    );
+    return pages.flat();
   }
 
   async deleted(ids: string[]): Promise<Set<string>> {
