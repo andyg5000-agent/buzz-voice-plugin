@@ -2,5 +2,52 @@
   "id": "blueoi.buzz-voice",
   "name": "Buzz Voice",
   "apiVersion": 1,
-  "description": "Find threads by state emoji and chat with the relay from one page. Voice comes later."
+  "description": "Talk to Buzz: speak a task, confirm it, and it posts to the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
+  "discovery": {
+    "category": "productivity",
+    "tags": [
+      "voice",
+      "speech",
+      "emoji"
+    ]
+  },
+  "host": {
+    "processes": [
+      {
+        "id": "stt",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\nn=${2:-small.en}\nw=$d/sherpa-onnx-whisper-$n\nb=$d/sherpa-onnx/bin/sherpa-onnx-offline\n[ -x \"$b\" ] || b=$(command -v sherpa-onnx-offline) || { echo '{\"error\":\"no-engine\"}'; exit 0; }\n[ -f \"$w/$n-tokens.txt\" ] || { echo '{\"error\":\"no-model\"}'; exit 0; }\nf=$(mktemp \"${TMPDIR:-/tmp}/buzz-voice.XXXXXX\") || exit 1\ntrap 'rm -f \"$f\"' EXIT\nopenssl base64 -d -A > \"$f\" || exit 1\n\"$b\" --whisper-encoder=\"$w/$n-encoder.int8.onnx\" --whisper-decoder=\"$w/$n-decoder.int8.onnx\" --tokens=\"$w/$n-tokens.txt\" --whisper-language=en --whisper-task=transcribe --num-threads=4 \"$f\" | grep '^{'",
+          "buzz-voice-stt"
+        ]
+      },
+      {
+        "id": "setup",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\nn=${3:-small.en}\nv=2.0.1\nr=https://github.com/k2-fsa/sherpa-onnx/releases/download\ne=false; if [ -x \"$d/sherpa-onnx/bin/sherpa-onnx-offline\" ] || command -v sherpa-onnx-offline >/dev/null; then e=true; fi\nm=false; [ -f \"$d/sherpa-onnx-whisper-$n/$n-tokens.txt\" ] && m=true\nif [ \"$2\" = install ]; then\nset -e; mkdir -p \"$d\"; cd \"$d\"\ncase $(uname -s) in Darwin) p=osx-universal2;; *) p=linux-x64;; esac\nif [ $e = false ]; then\necho \"progress engine\"\ncurl -fsSL \"$r/v$v/sherpa-onnx-v$v-$p-shared-no-tts.tar.bz2\" | tar xjf -\nrm -rf sherpa-onnx; mv \"sherpa-onnx-v$v-$p-shared-no-tts\" sherpa-onnx; e=true\nfi\nif [ $m = false ]; then\necho \"progress model\"\ncurl -fsSL \"$r/asr-models/sherpa-onnx-whisper-$n.tar.bz2\" | tar xjf -; m=true\nfi\nfi\ns=null; c=\"$HOME/Library/Application Support/com.blueoakinteractive.buzz-voice/settings.json\"\n[ -f \"$c\" ] && s=$(cat \"$c\")\nprintf '{\"engine\":%s,\"model\":%s,\"buzzVoice\":%s}\\n' $e $m \"$s\"",
+          "buzz-voice-setup"
+        ]
+      },
+      {
+        "id": "say",
+        "program": "say"
+      },
+      {
+        "id": "llm",
+        "program": "curl",
+        "args": [
+          "-sS",
+          "--max-time",
+          "120",
+          "-H",
+          "Content-Type: application/json",
+          "--data-binary",
+          "@-"
+        ]
+      }
+    ]
+  }
 }
