@@ -35,7 +35,7 @@ import {
   type Scope,
   type ScopeThread,
 } from "./scope";
-import { rootOf, tagValue, type Channel, type Decide, type Event, type Member, type Thread, type ThreadState, type Turn } from "./types";
+import { plain, rootOf, tagValue, type Channel, type Decide, type Event, type Member, type Thread, type ThreadState, type Turn } from "./types";
 
 export interface LogEntry {
   id: number;
@@ -595,7 +595,7 @@ export class Controller {
         rootId: root,
         channelId: item.channelId,
         channelName: channelName(item.channelId),
-        label: last.content.replace(/\s+/g, " ").trim().slice(0, 70) || root.slice(0, 8),
+        label: plain(last.content).slice(0, 70) || root.slice(0, 8),
         who: [...new Set(item.events.map((e) => names.get(e.pubkey) ?? e.pubkey.slice(0, 8)))],
         lastAt: last.created_at,
       };
@@ -654,7 +654,7 @@ export class Controller {
           rootId,
           channelId: channel.id,
           channelName: channel.name,
-          label: body.replace(/\s+/g, " ").slice(0, 70),
+          label: plain(body).slice(0, 70),
           who: mentioned.length ? [mentioned[0].name] : [],
           lastAt: event.created_at,
         },

@@ -63,3 +63,14 @@ export function rootOf(event: Event): string {
   const marked = event.tags.find((tag) => tag[0] === "e" && tag[3] === "root")?.[1];
   return marked ?? event.tags.find((tag) => tag[0] === "e" && tag[1])?.[1] ?? event.id;
 }
+
+export function plain(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/nostr:\S+/g, "")
+    .replace(/[*_~`]+/g, "")
+    .replace(/^#+\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}

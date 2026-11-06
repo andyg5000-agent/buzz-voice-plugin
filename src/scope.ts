@@ -1,4 +1,4 @@
-import type { Channel, Thread } from "./types";
+import { plain, type Channel, type Thread } from "./types";
 export interface ScopeThread {
   rootId: string;
   channelId: string;
@@ -20,7 +20,7 @@ export function emptyScope(): Scope {
 
 export function describeThread(thread: Thread, names: Map<string, string>): ScopeThread {
   const root = thread.messages[0];
-  const label = (root?.content ?? "").replace(/\s+/g, " ").trim().slice(0, 70);
+  const label = plain(root?.content ?? "").slice(0, 70);
   const who = [
     ...new Set(thread.messages.map((m) => names.get(m.pubkey) ?? m.pubkey.slice(0, 8))),
   ].slice(0, 4);
