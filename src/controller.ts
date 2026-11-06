@@ -78,6 +78,7 @@ interface Tracked {
 export interface VoiceState {
   ready: boolean;
   listening: boolean;
+  opening: boolean;
   latched: boolean;
   transcribing: boolean;
   busy: boolean;
@@ -170,6 +171,7 @@ export class Controller {
   private timer: ReturnType<typeof setInterval> | null = null;
   private polling = false;
   private levelFrame = 0;
+  private stopWhenOpen = false;
 
   constructor(private readonly deps: ControllerDeps) {
     this.speaker = new Speaker(deps.host, () => this.state.settings);
@@ -177,6 +179,7 @@ export class Controller {
     this.state = {
       ready: false,
       listening: false,
+      opening: false,
       latched: false,
       transcribing: false,
       busy: false,
@@ -213,7 +216,7 @@ export class Controller {
     return () => {
       if (this.timer) clearInterval(this.timer);
       this.timer = null;
-      this.recorder.cancel();
+      this.recorder.release();
       this.speaker.stop();
     };
   }
@@ -226,6 +229,7 @@ export class Controller {
 
   updateSettings(patch: Partial<Settings>): void {
     const settings = { ...this.state.settings, ...patch };
+    if (patch.microphone !== undefined && patch.microphone !== this.state.settings.microphone) this.recorder.release();
     saveSettings(settings);
     this.set({ settings });
   }
@@ -296,7 +300,10 @@ export class Controller {
       this.setStatus("Install the speech engine in Settings first.", true);
       return;
     }
+    if (this.state.opening) return;
     this.speaker.stop();
+    this.stopWhenOpen = false;
+    if (!this.recorder.open) this.set({ opening: true, status: "Opening the microphone...", statusBad: false });
     try {
       await this.recorder.start((level) => {
         if (this.levelFrame) return;
@@ -304,11 +311,20 @@ export class Controller {
           this.levelFrame = 0;
           this.set({ level });
         });
-      });
-      this.set({ listening: true, latched: false, status: "Listening..." , statusBad: false });
+      }, this.state.settings.microphone);
+      this.set({ opening: false, listening: true, latched: false, status: "Listening...", statusBad: false });
+      if (this.stopWhenOpen) await this.stopListening();
     } catch (error) {
+      this.set({ opening: false });
       this.setStatus(`Microphone: ${message(error)}`, true);
     }
+  }
+
+  warmMicrophone(): void {
+    if (!this.state.ready || this.recorder.open) return;
+    void this.recorder.warm(this.state.settings.microphone).catch((error) => {
+      this.setStatus(`Microphone: ${message(error)}`, true);
+    });
   }
 
   latch(): void {
@@ -322,6 +338,10 @@ export class Controller {
   }
 
   async stopListening(): Promise<void> {
+    if (this.state.opening) {
+      this.stopWhenOpen = true;
+      return;
+    }
     if (!this.state.listening) return;
     const audio = await this.recorder.stop();
     this.set({ listening: false, latched: false, level: 0, transcribing: true, status: "Transcribing..." });

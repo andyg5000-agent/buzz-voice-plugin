@@ -8,7 +8,8 @@ var DEFAULT_SETTINGS = {
   llmModel: "",
   llmKey: "",
   voice: "",
-  speak: true
+  speak: true,
+  microphone: ""
 };
 var SETTINGS_KEY = "buzz-voice-plugin.settings";
 function storage() {
@@ -145,38 +146,78 @@ var Speaker = class {
 };
 var TARGET_RATE = 16e3;
 var MAX_SECONDS = 120;
+var PREROLL_SECONDS = 0.6;
+var IDLE_RELEASE_MS = 10 * 6e4;
 var Recorder = class {
   stream = null;
   context = null;
   node = null;
+  opening = null;
+  deviceId = "";
+  capturing = false;
   chunks = [];
   samples = 0;
+  preroll = [];
+  prerollSamples = 0;
+  idleTimer = null;
+  onLevel = () => {
+  };
   level = 0;
   get active() {
+    return this.capturing;
+  }
+  get open() {
     return this.stream !== null;
   }
-  async start(onLevel) {
-    if (this.stream) return;
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not available here.");
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  async warm(deviceId) {
+    if (this.stream && this.deviceId === deviceId) {
+      this.armIdle();
+      return;
+    }
+    if (this.opening && this.deviceId === deviceId) return this.opening;
+    this.release();
+    this.deviceId = deviceId;
+    this.opening = this.openStream(deviceId).finally(() => {
+      this.opening = null;
     });
+    return this.opening;
+  }
+  async openStream(deviceId) {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not available here.");
+    const audio = {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      ...deviceId ? { deviceId: { exact: deviceId } } : {}
+    };
+    const stream = await navigator.mediaDevices.getUserMedia({ audio });
+    if (this.deviceId !== deviceId) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     const Context = window.AudioContext ?? window.webkitAudioContext;
     const context = new Context();
     const source = context.createMediaStreamSource(stream);
-    const node = context.createScriptProcessor(4096, 1, 1);
-    this.chunks = [];
-    this.samples = 0;
+    const node = context.createScriptProcessor(2048, 1, 1);
     node.onaudioprocess = (event) => {
-      const input = event.inputBuffer.getChannelData(0);
-      if (this.samples < context.sampleRate * MAX_SECONDS) {
-        this.chunks.push(new Float32Array(input));
-        this.samples += input.length;
+      const input = new Float32Array(event.inputBuffer.getChannelData(0));
+      if (this.capturing) {
+        if (this.samples < context.sampleRate * MAX_SECONDS) {
+          this.chunks.push(input);
+          this.samples += input.length;
+        }
+        let peak = 0;
+        for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
+        this.level = peak;
+        this.onLevel(peak);
+      } else {
+        this.preroll.push(input);
+        this.prerollSamples += input.length;
+        while (this.prerollSamples - (this.preroll[0]?.length ?? 0) > context.sampleRate * PREROLL_SECONDS) {
+          this.prerollSamples -= this.preroll.shift().length;
+        }
       }
-      let peak = 0;
-      for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
-      this.level = peak;
-      onLevel(peak);
     };
     source.connect(node);
     node.connect(context.destination);
@@ -184,31 +225,58 @@ var Recorder = class {
     this.context = context;
     this.node = node;
     if (context.state === "suspended") await context.resume();
+    stream.getTracks().forEach((track) => track.addEventListener("ended", () => this.release()));
+    this.armIdle();
+  }
+  armIdle() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (!this.capturing) this.release();
+    }, IDLE_RELEASE_MS);
+  }
+  async start(onLevel, deviceId = "") {
+    if (this.capturing) return;
+    await this.warm(deviceId);
+    if (!this.context) throw new Error("The microphone did not open.");
+    if (this.context.state === "suspended") await this.context.resume();
+    this.onLevel = onLevel;
+    this.chunks = [...this.preroll];
+    this.samples = this.prerollSamples;
+    this.preroll = [];
+    this.prerollSamples = 0;
+    this.capturing = true;
   }
   async stop() {
     const context = this.context;
-    if (!context) return null;
+    if (!context || !this.capturing) return null;
+    this.capturing = false;
+    this.level = 0;
+    this.armIdle();
     const rate = context.sampleRate;
-    this.node?.disconnect();
-    this.stream?.getTracks().forEach((track) => track.stop());
-    await context.close().catch(() => void 0);
-    this.stream = null;
-    this.context = null;
-    this.node = null;
     const merged = new Float32Array(this.samples);
     let at = 0;
     for (const chunk2 of this.chunks) {
-      merged.set(chunk2.subarray(0, Math.min(chunk2.length, merged.length - at)), at);
-      at += chunk2.length;
+      const take = Math.min(chunk2.length, merged.length - at);
+      merged.set(chunk2.subarray(0, take), at);
+      at += take;
       if (at >= merged.length) break;
     }
     this.chunks = [];
+    this.samples = 0;
     const pcm = resample(merged, rate, TARGET_RATE);
     let peak = 0;
     for (let i = 0; i < pcm.length; i += 1) peak = Math.max(peak, Math.abs(pcm[i]));
     return { base64: toBase64(wav(pcm, TARGET_RATE)), seconds: pcm.length / TARGET_RATE, peak };
   }
   cancel() {
+    this.capturing = false;
+    this.chunks = [];
+    this.samples = 0;
+  }
+  release() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    this.capturing = false;
     this.node?.disconnect();
     this.stream?.getTracks().forEach((track) => track.stop());
     void this.context?.close().catch(() => void 0);
@@ -216,8 +284,15 @@ var Recorder = class {
     this.context = null;
     this.node = null;
     this.chunks = [];
+    this.preroll = [];
+    this.prerollSamples = 0;
   }
 };
+async function listMicrophones() {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices.filter((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications").map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
+}
 function resample(input, from, to) {
   if (from === to) return input;
   const ratio = from / to;
@@ -1131,6 +1206,7 @@ var Controller = class {
     this.state = {
       ready: false,
       listening: false,
+      opening: false,
       latched: false,
       transcribing: false,
       busy: false,
@@ -1161,6 +1237,7 @@ var Controller = class {
   timer = null;
   polling = false;
   levelFrame = 0;
+  stopWhenOpen = false;
   subscribe = (listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -1176,7 +1253,7 @@ var Controller = class {
     return () => {
       if (this.timer) clearInterval(this.timer);
       this.timer = null;
-      this.recorder.cancel();
+      this.recorder.release();
       this.speaker.stop();
     };
   }
@@ -1187,6 +1264,7 @@ var Controller = class {
   }
   updateSettings(patch) {
     const settings = { ...this.state.settings, ...patch };
+    if (patch.microphone !== void 0 && patch.microphone !== this.state.settings.microphone) this.recorder.release();
     saveSettings(settings);
     this.set({ settings });
   }
@@ -1250,7 +1328,10 @@ var Controller = class {
       this.setStatus("Install the speech engine in Settings first.", true);
       return;
     }
+    if (this.state.opening) return;
     this.speaker.stop();
+    this.stopWhenOpen = false;
+    if (!this.recorder.open) this.set({ opening: true, status: "Opening the microphone...", statusBad: false });
     try {
       await this.recorder.start((level) => {
         if (this.levelFrame) return;
@@ -1258,11 +1339,19 @@ var Controller = class {
           this.levelFrame = 0;
           this.set({ level });
         });
-      });
-      this.set({ listening: true, latched: false, status: "Listening...", statusBad: false });
+      }, this.state.settings.microphone);
+      this.set({ opening: false, listening: true, latched: false, status: "Listening...", statusBad: false });
+      if (this.stopWhenOpen) await this.stopListening();
     } catch (error) {
+      this.set({ opening: false });
       this.setStatus(`Microphone: ${message(error)}`, true);
     }
+  }
+  warmMicrophone() {
+    if (!this.state.ready || this.recorder.open) return;
+    void this.recorder.warm(this.state.settings.microphone).catch((error) => {
+      this.setStatus(`Microphone: ${message(error)}`, true);
+    });
   }
   latch() {
     if (this.state.listening) this.set({ latched: true });
@@ -1273,6 +1362,10 @@ var Controller = class {
     this.latch();
   }
   async stopListening() {
+    if (this.state.opening) {
+      this.stopWhenOpen = true;
+      return;
+    }
     if (!this.state.listening) return;
     const audio = await this.recorder.stop();
     this.set({ listening: false, latched: false, level: 0, transcribing: true, status: "Transcribing..." });
@@ -2279,7 +2372,7 @@ function createUi(deps) {
   }
   function TalkButton({ voice }) {
     const pressedAt = useRef(0);
-    const label = voice.transcribing ? "Transcribing..." : voice.listening ? voice.latched ? "Recording. Tap to stop" : "Listening. Release to send" : "Tap or hold to talk";
+    const label = voice.opening ? "Opening the microphone..." : voice.transcribing ? "Transcribing..." : voice.listening ? voice.latched ? "Recording. Tap to stop" : "Listening. Release to send" : "Tap or hold to talk";
     const down = (event) => {
       if (event.button !== void 0 && event.button !== 0) return;
       event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -2321,6 +2414,9 @@ function createUi(deps) {
   function Talk({ voice }) {
     const [typed, setTyped] = useState("");
     const log = useRef(null);
+    useEffect(() => {
+      if (voice.ready) controller.warmMicrophone();
+    }, [voice.ready, voice.settings.microphone]);
     useEffect(() => {
       const node = log.current;
       if (node) node.scrollTop = node.scrollHeight;
@@ -2655,6 +2751,34 @@ function createUi(deps) {
       )
     );
   }
+  function MicrophonePicker({ value }) {
+    const [devices, setDevices] = useState([]);
+    useEffect(() => {
+      let live = true;
+      const load = () => void listMicrophones().then((list) => live && setDevices(list)).catch(() => void 0);
+      load();
+      navigator.mediaDevices?.addEventListener?.("devicechange", load);
+      return () => {
+        live = false;
+        navigator.mediaDevices?.removeEventListener?.("devicechange", load);
+      };
+    }, []);
+    return h(
+      "select",
+      {
+        "aria-label": "Microphone",
+        "data-buzz-ui": "",
+        className: "buzz-input",
+        "data-size": "md",
+        style: { width: "14rem", maxWidth: "100%" },
+        value,
+        onChange: (e) => controller.updateSettings({ microphone: e.target.value })
+      },
+      h("option", { value: "" }, "System default"),
+      devices.map((d) => h("option", { key: d.id, value: d.id }, d.label)),
+      value && !devices.some((d) => d.id === value) && h("option", { value }, "Saved microphone (not connected)")
+    );
+  }
   function SettingsCard() {
     const voice = useVoice();
     const settings = voice.settings;
@@ -2692,6 +2816,8 @@ function createUi(deps) {
         subtitle: "Writes messages and reads channels back. Routing uses your Decisions API provider when one is on."
       }),
       h(LlmForm, { settings }),
+      h(Header, { inline: true, title: "Microphone" }),
+      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
       h(Header, { inline: true, title: "Spoken replies" }),
       h(
         Group,

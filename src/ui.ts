@@ -1,5 +1,5 @@
 import { mentionsIn, type Controller, type LogEntry, type VoiceState } from "./controller";
-import type { Settings } from "./engine";
+import { listMicrophones, type Settings } from "./engine";
 import { emojiCounts, emptyFlagSource, groupFlags, loadFlags, type Flag, type FlagSource } from "./flags";
 import type { Relay } from "./relay";
 
@@ -427,7 +427,9 @@ export function createUi(deps: UiDeps) {
 
   function TalkButton({ voice }: { voice: VoiceState }) {
     const pressedAt = useRef(0);
-    const label = voice.transcribing
+    const label = voice.opening
+      ? "Opening the microphone..."
+      : voice.transcribing
       ? "Transcribing..."
       : voice.listening
         ? voice.latched
@@ -476,6 +478,9 @@ export function createUi(deps: UiDeps) {
   function Talk({ voice }: { voice: VoiceState }) {
     const [typed, setTyped] = useState("");
     const log = useRef(null as any);
+    useEffect(() => {
+      if (voice.ready) controller.warmMicrophone();
+    }, [voice.ready, voice.settings.microphone]);
     useEffect(() => {
       const node = log.current;
       if (node) node.scrollTop = node.scrollHeight;
@@ -837,6 +842,35 @@ export function createUi(deps: UiDeps) {
     );
   }
 
+  function MicrophonePicker({ value }: { value: string }) {
+    const [devices, setDevices]: [{ id: string; label: string }[], (v: { id: string; label: string }[]) => void] = useState([]);
+    useEffect(() => {
+      let live = true;
+      const load = () => void listMicrophones().then((list) => live && setDevices(list)).catch(() => undefined);
+      load();
+      navigator.mediaDevices?.addEventListener?.("devicechange", load);
+      return () => {
+        live = false;
+        navigator.mediaDevices?.removeEventListener?.("devicechange", load);
+      };
+    }, []);
+    return h(
+      "select",
+      {
+        "aria-label": "Microphone",
+        "data-buzz-ui": "",
+        className: "buzz-input",
+        "data-size": "md",
+        style: { width: "14rem", maxWidth: "100%" },
+        value,
+        onChange: (e: any) => controller.updateSettings({ microphone: e.target.value }),
+      },
+      h("option", { value: "" }, "System default"),
+      devices.map((d) => h("option", { key: d.id, value: d.id }, d.label)),
+      value && !devices.some((d) => d.id === value) && h("option", { value }, "Saved microphone (not connected)"),
+    );
+  }
+
   function SettingsCard() {
     const voice = useVoice();
     const settings = voice.settings;
@@ -882,6 +916,8 @@ export function createUi(deps: UiDeps) {
         subtitle: "Writes messages and reads channels back. Routing uses your Decisions API provider when one is on.",
       }),
       h(LlmForm, { settings }),
+      h(Header, { inline: true, title: "Microphone" }),
+      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
       h(Header, { inline: true, title: "Spoken replies" }),
       h(
         Group,

@@ -20,6 +20,7 @@ export interface Settings {
   llmKey: string;
   voice: string;
   speak: boolean;
+  microphone: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -30,6 +31,7 @@ export const DEFAULT_SETTINGS: Settings = {
   llmKey: "",
   voice: "",
   speak: true,
+  microphone: "",
 };
 
 const SETTINGS_KEY = "buzz-voice-plugin.settings";
@@ -210,40 +212,82 @@ export class Speaker {
 const TARGET_RATE = 16000;
 const MAX_SECONDS = 120;
 
+const PREROLL_SECONDS = 0.6;
+const IDLE_RELEASE_MS = 10 * 60_000;
+
 export class Recorder {
   private stream: MediaStream | null = null;
   private context: AudioContext | null = null;
   private node: ScriptProcessorNode | null = null;
+  private opening: Promise<void> | null = null;
+  private deviceId = "";
+  private capturing = false;
   private chunks: Float32Array[] = [];
   private samples = 0;
+  private preroll: Float32Array[] = [];
+  private prerollSamples = 0;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private onLevel: (level: number) => void = () => {};
   level = 0;
 
   get active(): boolean {
+    return this.capturing;
+  }
+
+  get open(): boolean {
     return this.stream !== null;
   }
 
-  async start(onLevel: (level: number) => void): Promise<void> {
-    if (this.stream) return;
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not available here.");
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  async warm(deviceId: string): Promise<void> {
+    if (this.stream && this.deviceId === deviceId) {
+      this.armIdle();
+      return;
+    }
+    if (this.opening && this.deviceId === deviceId) return this.opening;
+    this.release();
+    this.deviceId = deviceId;
+    this.opening = this.openStream(deviceId).finally(() => {
+      this.opening = null;
     });
+    return this.opening;
+  }
+
+  private async openStream(deviceId: string): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not available here.");
+    const audio: MediaTrackConstraints = {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    };
+    const stream = await navigator.mediaDevices.getUserMedia({ audio });
+    if (this.deviceId !== deviceId) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     const Context = window.AudioContext ?? (window as any).webkitAudioContext;
     const context: AudioContext = new Context();
     const source = context.createMediaStreamSource(stream);
-    const node = context.createScriptProcessor(4096, 1, 1);
-    this.chunks = [];
-    this.samples = 0;
+    const node = context.createScriptProcessor(2048, 1, 1);
     node.onaudioprocess = (event) => {
-      const input = event.inputBuffer.getChannelData(0);
-      if (this.samples < context.sampleRate * MAX_SECONDS) {
-        this.chunks.push(new Float32Array(input));
-        this.samples += input.length;
+      const input = new Float32Array(event.inputBuffer.getChannelData(0));
+      if (this.capturing) {
+        if (this.samples < context.sampleRate * MAX_SECONDS) {
+          this.chunks.push(input);
+          this.samples += input.length;
+        }
+        let peak = 0;
+        for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
+        this.level = peak;
+        this.onLevel(peak);
+      } else {
+        this.preroll.push(input);
+        this.prerollSamples += input.length;
+        while (this.prerollSamples - (this.preroll[0]?.length ?? 0) > context.sampleRate * PREROLL_SECONDS) {
+          this.prerollSamples -= this.preroll.shift()!.length;
+        }
       }
-      let peak = 0;
-      for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
-      this.level = peak;
-      onLevel(peak);
     };
     source.connect(node);
     node.connect(context.destination);
@@ -251,26 +295,47 @@ export class Recorder {
     this.context = context;
     this.node = node;
     if (context.state === "suspended") await context.resume();
+    stream.getTracks().forEach((track) => track.addEventListener("ended", () => this.release()));
+    this.armIdle();
+  }
+
+  private armIdle(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (!this.capturing) this.release();
+    }, IDLE_RELEASE_MS);
+  }
+
+  async start(onLevel: (level: number) => void, deviceId = ""): Promise<void> {
+    if (this.capturing) return;
+    await this.warm(deviceId);
+    if (!this.context) throw new Error("The microphone did not open.");
+    if (this.context.state === "suspended") await this.context.resume();
+    this.onLevel = onLevel;
+    this.chunks = [...this.preroll];
+    this.samples = this.prerollSamples;
+    this.preroll = [];
+    this.prerollSamples = 0;
+    this.capturing = true;
   }
 
   async stop(): Promise<{ base64: string; seconds: number; peak: number } | null> {
     const context = this.context;
-    if (!context) return null;
+    if (!context || !this.capturing) return null;
+    this.capturing = false;
+    this.level = 0;
+    this.armIdle();
     const rate = context.sampleRate;
-    this.node?.disconnect();
-    this.stream?.getTracks().forEach((track) => track.stop());
-    await context.close().catch(() => undefined);
-    this.stream = null;
-    this.context = null;
-    this.node = null;
     const merged = new Float32Array(this.samples);
     let at = 0;
     for (const chunk of this.chunks) {
-      merged.set(chunk.subarray(0, Math.min(chunk.length, merged.length - at)), at);
-      at += chunk.length;
+      const take = Math.min(chunk.length, merged.length - at);
+      merged.set(chunk.subarray(0, take), at);
+      at += take;
       if (at >= merged.length) break;
     }
     this.chunks = [];
+    this.samples = 0;
     const pcm = resample(merged, rate, TARGET_RATE);
     let peak = 0;
     for (let i = 0; i < pcm.length; i += 1) peak = Math.max(peak, Math.abs(pcm[i]));
@@ -278,6 +343,15 @@ export class Recorder {
   }
 
   cancel(): void {
+    this.capturing = false;
+    this.chunks = [];
+    this.samples = 0;
+  }
+
+  release(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+    this.capturing = false;
     this.node?.disconnect();
     this.stream?.getTracks().forEach((track) => track.stop());
     void this.context?.close().catch(() => undefined);
@@ -285,7 +359,17 @@ export class Recorder {
     this.context = null;
     this.node = null;
     this.chunks = [];
+    this.preroll = [];
+    this.prerollSamples = 0;
   }
+}
+
+export async function listMicrophones(): Promise<{ id: string; label: string }[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== "default" && d.deviceId !== "communications")
+    .map((d, i) => ({ id: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
 }
 
 export function resample(input: Float32Array, from: number, to: number): Float32Array {
