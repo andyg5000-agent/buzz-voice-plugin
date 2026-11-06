@@ -1381,13 +1381,13 @@ var Controller = class {
         this.reply(`I heard ${channel.name} but no task in that.`, { bad: true });
         return;
       }
-      const members = await relay.members(channel);
+      const target = intent.new_thread ? null : resolveThread(this.scope, channel, intent.thread_ref) ?? await this.findThread(relay, channel, intent, text);
+      if (!live()) return;
+      const members = await this.rankedMembers(relay, channel, target?.rootId ?? null);
       if (!live()) return;
       const mention = intent.recipient ? bestPerson(members, (m) => m.name, intent.recipient, text) : null;
       const addressed = mention?.name ?? intent.recipient;
       const body = addressed ? `@${addressed} ${intent.instruction}` : intent.instruction;
-      const target = intent.new_thread ? null : resolveThread(this.scope, channel, intent.thread_ref) ?? await this.findThread(relay, channel, intent, text);
-      if (!live()) return;
       this.set({
         pending: {
           channel,
@@ -1407,6 +1407,30 @@ var Controller = class {
     } finally {
       if (live()) this.set({ busy: false });
     }
+  }
+  async rankedMembers(relay, channel, rootId) {
+    const [roster, recent, thread] = await Promise.all([
+      relay.members(channel).catch(() => []),
+      relay.threads(channel.id, 120).catch(() => []),
+      rootId ? Promise.all([relay.byIds([rootId]), relay.messagesInThread(channel.id, rootId)]).then(([root, replies]) => [...root, ...replies]).catch(() => []) : Promise.resolve([])
+    ]);
+    const lastSeen = (events) => {
+      const at = /* @__PURE__ */ new Map();
+      for (const event of events) {
+        if (event.pubkey === relay.pubkey) continue;
+        at.set(event.pubkey, Math.max(at.get(event.pubkey) ?? 0, event.created_at));
+      }
+      return [...at.entries()].sort((a, b) => b[1] - a[1]).map(([pubkey]) => pubkey);
+    };
+    const order = [
+      ...lastSeen(thread),
+      ...lastSeen(recent.flatMap((t) => t.messages)),
+      ...roster.map((m) => m.pubkey)
+    ];
+    const unique = [...new Set(order)];
+    const names = await relay.profiles(unique.filter((pubkey) => !roster.some((m) => m.pubkey === pubkey)));
+    for (const member of roster) names.set(member.pubkey, member.name);
+    return unique.map((pubkey) => ({ pubkey, name: names.get(pubkey) ?? "" })).filter((m) => m.name);
   }
   async findThread(relay, channel, intent, transcript) {
     this.setStatus(`Finding the thread in ${channel.name}...`);
