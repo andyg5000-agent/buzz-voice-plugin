@@ -11,6 +11,9 @@
       "emoji"
     ]
   },
+  "updates": {
+    "defaultEnabled": true
+  },
   "host": {
     "processes": [
       {

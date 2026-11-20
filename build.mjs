@@ -14,6 +14,7 @@ const manifest = {
   description:
     "Talk to Buzz, hands-free or push to talk: speak a task or a todo, confirm it, and it lands in the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
   discovery: { category: "productivity", tags: ["voice", "speech", "emoji"] },
+  updates: { defaultEnabled: true },
   host: {
     processes: [
       { id: "stt", program: "sh", args: ["-c", script("stt"), "buzz-voice-stt"] },
