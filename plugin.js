@@ -75,6 +75,18 @@ async function run(host, id, args, input, onLine) {
   const code = await process.exited;
   return { code, stdout, stderr };
 }
+function parseVoices(stdout) {
+  const voices = [];
+  for (const line2 of stdout.split("\n")) {
+    const match = /^(.+?)\s+([a-z]{2,3}[_-][A-Za-z0-9_-]+)\s+#/.exec(line2);
+    if (match) voices.push({ name: match[1].trim(), locale: match[2].replace("-", "_") });
+  }
+  return voices;
+}
+async function listVoices(host) {
+  const result = await run(host, "say", ["-v", "?"]);
+  return parseVoices(result.stdout);
+}
 function parseStatus(stdout, runtime) {
   const at = stdout.indexOf('{"engine"');
   if (at < 0) throw new Error("The setup script returned nothing.");
@@ -278,9 +290,9 @@ var Speaker = class {
   get speaking() {
     return this.queued > 0;
   }
-  speak(text3) {
+  speak(text3, force = false) {
     const settings = this.settings();
-    if (!settings.speak) return;
+    if (!settings.speak && !force) return;
     const clean2 = text3.replace(/^[\s-]+/, "").trim();
     if (!clean2) return;
     this.queued += 1;
@@ -292,11 +304,14 @@ var Speaker = class {
   async say(text3, settings) {
     if (this.host.spawn) {
       try {
-        const args = settings.voice ? ["-v", settings.voice, text3] : [text3];
-        this.current = await this.host.spawn("say", { args });
-        await this.current.end();
-        await this.current.exited;
-        this.current = null;
+        for (const args of settings.voice ? [["-v", settings.voice, text3], [text3]] : [[text3]]) {
+          const generation = this.generation;
+          this.current = await this.host.spawn("say", { args });
+          await this.current.end();
+          const code = await this.current.exited;
+          this.current = null;
+          if (code === 0 || generation !== this.generation) break;
+        }
         return;
       } catch {
         this.current = null;
@@ -6873,6 +6888,13 @@ var Controller = class {
   stopSpeaking() {
     this.speaker.stop();
   }
+  voices() {
+    return listVoices(this.deps.host);
+  }
+  testVoice() {
+    this.speaker.stop();
+    this.speaker.speak("Hi, this is how Buzz Voice will sound.", true);
+  }
   async startListening() {
     if (this.state.listening || this.state.transcribing) return;
     if (!this.state.ready) {
@@ -9001,6 +9023,45 @@ function createUi(deps) {
       )
     );
   }
+  function VoicePicker({ value }) {
+    const [voices, setVoices] = useState([]);
+    const [state, setState] = useState("loading");
+    const load = useCallback(() => {
+      setState("loading");
+      controller.voices().then((list2) => {
+        setVoices(list2);
+        setState(list2.length ? "" : "none");
+      }).catch(() => setState("failed"));
+    }, []);
+    useEffect(load, [load]);
+    const english = voices.filter((v) => v.locale.startsWith("en"));
+    const others = voices.filter((v) => !v.locale.startsWith("en"));
+    const quality = (v) => /\(Premium\)/.test(v.name) ? 0 : /\(Enhanced\)/.test(v.name) ? 1 : 2;
+    const sorted = (list2) => [...list2].sort((a, b) => quality(a) - quality(b) || a.name.localeCompare(b.name));
+    const option = (v) => h("option", { key: v.name, value: v.name }, `${v.name} \xB7 ${v.locale.replace("_", "-")}`);
+    return h(
+      "div",
+      { className: "bv-row" },
+      h(
+        "select",
+        {
+          "aria-label": "Voice",
+          "data-buzz-ui": "",
+          className: "buzz-input",
+          "data-size": "md",
+          style: { width: "14rem", maxWidth: "100%" },
+          value,
+          onChange: (e) => controller.updateSettings({ voice: e.target.value })
+        },
+        h("option", { value: "" }, state === "loading" ? "Loading voices..." : state === "failed" ? "System voice (list unavailable)" : "System voice"),
+        english.length > 0 && h("optgroup", { label: "English" }, sorted(english).map(option)),
+        others.length > 0 && h("optgroup", { label: "Other languages" }, sorted(others).map(option)),
+        value && state !== "loading" && !voices.some((v) => v.name === value) && h("option", { value }, `${value} (not installed)`)
+      ),
+      h(IconButton, { label: "Refresh voices", icon: "refresh", disabled: state === "loading", onClick: load }),
+      h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test")
+    );
+  }
   function MicrophonePicker({ value }) {
     const [devices, setDevices] = useState([]);
     useEffect(() => {
@@ -9099,14 +9160,8 @@ function createUi(deps) {
         }),
         h(Row, {
           title: "Voice",
-          subtitle: "A macOS voice name. Blank uses the system voice.",
-          trailing: h(Input, {
-            "aria-label": "Voice",
-            value: settings.voice,
-            placeholder: "System",
-            style: { width: "10rem" },
-            onChange: (e) => controller.updateSettings({ voice: e.target.value })
-          })
+          subtitle: "Download better voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
+          trailing: h(VoicePicker, { value: settings.voice })
         })
       ),
       h(Header, { inline: true, title: "Shortcuts" }),

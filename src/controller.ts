@@ -15,6 +15,8 @@ import {
   type Heard,
   type Host,
   type Settings,
+  listVoices,
+  type SystemVoice,
 } from "./engine";
 import {
   parseIntent,
@@ -451,6 +453,15 @@ export class Controller {
 
   stopSpeaking(): void {
     this.speaker.stop();
+  }
+
+  voices(): Promise<SystemVoice[]> {
+    return listVoices(this.deps.host);
+  }
+
+  testVoice(): void {
+    this.speaker.stop();
+    this.speaker.speak("Hi, this is how Buzz Voice will sound.", true);
   }
 
   async startListening(): Promise<void> {

@@ -113,6 +113,25 @@ async function run(
   return { code, stdout, stderr };
 }
 
+export interface SystemVoice {
+  name: string;
+  locale: string;
+}
+
+export function parseVoices(stdout: string): SystemVoice[] {
+  const voices: SystemVoice[] = [];
+  for (const line of stdout.split("\n")) {
+    const match = /^(.+?)\s+([a-z]{2,3}[_-][A-Za-z0-9_-]+)\s+#/.exec(line);
+    if (match) voices.push({ name: match[1].trim(), locale: match[2].replace("-", "_") });
+  }
+  return voices;
+}
+
+export async function listVoices(host: Host): Promise<SystemVoice[]> {
+  const result = await run(host, "say", ["-v", "?"]);
+  return parseVoices(result.stdout);
+}
+
 export interface EngineStatus {
   engine: boolean;
   model: boolean;
@@ -347,9 +366,9 @@ export class Speaker {
     private readonly settings: () => Settings,
   ) {}
 
-  speak(text: string): void {
+  speak(text: string, force = false): void {
     const settings = this.settings();
-    if (!settings.speak) return;
+    if (!settings.speak && !force) return;
     const clean = text.replace(/^[\s-]+/, "").trim();
     if (!clean) return;
     this.queued += 1;
@@ -365,11 +384,14 @@ export class Speaker {
   private async say(text: string, settings: Settings): Promise<void> {
     if (this.host.spawn) {
       try {
-        const args = settings.voice ? ["-v", settings.voice, text] : [text];
-        this.current = await this.host.spawn("say", { args });
-        await this.current.end();
-        await this.current.exited;
-        this.current = null;
+        for (const args of settings.voice ? [["-v", settings.voice, text], [text]] : [[text]]) {
+          const generation = this.generation;
+          this.current = await this.host.spawn("say", { args });
+          await this.current.end();
+          const code = await this.current.exited;
+          this.current = null;
+          if (code === 0 || generation !== this.generation) break;
+        }
         return;
       } catch {
         this.current = null;

@@ -1,5 +1,5 @@
 import { mentionsIn, type Controller, type LogEntry, type VoiceState } from "./controller";
-import { listMicrophones, loadJson, saveJson, type Settings } from "./engine";
+import { listMicrophones, loadJson, saveJson, type Settings, type SystemVoice } from "./engine";
 import {
   DEFAULT_FLAGS,
   emojiCounts,
@@ -1275,6 +1275,49 @@ export function createUi(deps: UiDeps) {
     );
   }
 
+  function VoicePicker({ value }: { value: string }) {
+    const [voices, setVoices]: [SystemVoice[], (v: SystemVoice[]) => void] = useState([]);
+    const [state, setState] = useState("loading");
+    const load = useCallback(() => {
+      setState("loading");
+      controller
+        .voices()
+        .then((list) => {
+          setVoices(list);
+          setState(list.length ? "" : "none");
+        })
+        .catch(() => setState("failed"));
+    }, []);
+    useEffect(load, [load]);
+    const english = voices.filter((v) => v.locale.startsWith("en"));
+    const others = voices.filter((v) => !v.locale.startsWith("en"));
+    const quality = (v: SystemVoice) => (/\(Premium\)/.test(v.name) ? 0 : /\(Enhanced\)/.test(v.name) ? 1 : 2);
+    const sorted = (list: SystemVoice[]) => [...list].sort((a, b) => quality(a) - quality(b) || a.name.localeCompare(b.name));
+    const option = (v: SystemVoice) => h("option", { key: v.name, value: v.name }, `${v.name} · ${v.locale.replace("_", "-")}`);
+    return h(
+      "div",
+      { className: "bv-row" },
+      h(
+        "select",
+        {
+          "aria-label": "Voice",
+          "data-buzz-ui": "",
+          className: "buzz-input",
+          "data-size": "md",
+          style: { width: "14rem", maxWidth: "100%" },
+          value,
+          onChange: (e: any) => controller.updateSettings({ voice: e.target.value }),
+        },
+        h("option", { value: "" }, state === "loading" ? "Loading voices..." : state === "failed" ? "System voice (list unavailable)" : "System voice"),
+        english.length > 0 && h("optgroup", { label: "English" }, sorted(english).map(option)),
+        others.length > 0 && h("optgroup", { label: "Other languages" }, sorted(others).map(option)),
+        value && state !== "loading" && !voices.some((v) => v.name === value) && h("option", { value }, `${value} (not installed)`),
+      ),
+      h(IconButton, { label: "Refresh voices", icon: "refresh", disabled: state === "loading", onClick: load }),
+      h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test"),
+    );
+  }
+
   function MicrophonePicker({ value }: { value: string }) {
     const [devices, setDevices]: [{ id: string; label: string }[], (v: { id: string; label: string }[]) => void] = useState([]);
     useEffect(() => {
@@ -1386,14 +1429,8 @@ export function createUi(deps: UiDeps) {
         }),
         h(Row, {
           title: "Voice",
-          subtitle: "A macOS voice name. Blank uses the system voice.",
-          trailing: h(Input, {
-            "aria-label": "Voice",
-            value: settings.voice,
-            placeholder: "System",
-            style: { width: "10rem" },
-            onChange: (e: any) => controller.updateSettings({ voice: e.target.value }),
-          }),
+          subtitle: "Download better voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
+          trailing: h(VoicePicker, { value: settings.voice }),
         }),
       ),
       h(Header, { inline: true, title: "Shortcuts" }),
