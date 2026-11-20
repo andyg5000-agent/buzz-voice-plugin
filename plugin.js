@@ -7510,6 +7510,7 @@ function message(error) {
 var KIND_MESSAGE = 9;
 var KIND_REACTION = 7;
 var KIND_DELETE = 5;
+var KIND_EDIT = 40003;
 var CHUNK = 50;
 var READ_LIMIT = 500;
 function chunk(list2, size) {
@@ -7545,6 +7546,42 @@ var Relay = class {
   async messagesInThread(channelId, rootId) {
     const events = await this.query([{ kinds: [KIND_MESSAGE], "#h": [channelId], "#e": [rootId], limit: 200 }]);
     return events.sort(byTime);
+  }
+  /** A thread as Buzz shows it: root first, latest edits applied, deletions dropped, reactions counted. */
+  async fullThread(channelId, rootId) {
+    const [replies, roots] = await Promise.all([
+      this.query([{ kinds: [KIND_MESSAGE], "#h": [channelId], "#e": [rootId], limit: READ_LIMIT }]),
+      this.byIds([rootId])
+    ]);
+    const messages = [...roots, ...replies.filter((e) => e.id !== rootId)].sort(byTime);
+    const ids = messages.map((e) => e.id);
+    const related = [];
+    for (const batch of chunk(ids, CHUNK)) {
+      related.push(...await this.query([{ kinds: [KIND_EDIT, KIND_REACTION], "#e": batch, limit: READ_LIMIT }]));
+    }
+    const gone = await this.deleted([...ids, ...related.map((e) => e.id)]);
+    const edits = /* @__PURE__ */ new Map();
+    const reactions = /* @__PURE__ */ new Map();
+    for (const event of related.sort(byTime)) {
+      if (gone.has(event.id)) continue;
+      const target = event.tags.filter((t) => t[0] === "e" && t[1]).at(-1)?.[1];
+      if (!target) continue;
+      if (event.kind === KIND_EDIT) {
+        const original = messages.find((m) => m.id === target);
+        if (original && original.pubkey === event.pubkey) edits.set(target, event);
+        continue;
+      }
+      const emoji = event.content.replace(/\uFE0F/g, "").trim();
+      if (!emoji || emoji === "-") continue;
+      const byEmoji = reactions.get(target) ?? /* @__PURE__ */ new Map();
+      const who = byEmoji.get(emoji) ?? [];
+      if (!who.includes(event.pubkey)) who.push(event.pubkey);
+      byEmoji.set(emoji, who);
+      reactions.set(target, byEmoji);
+    }
+    const shown = messages.filter((e) => !gone.has(e.id)).map((e) => ({ ...e, content: edits.get(e.id)?.content ?? e.content, edited: edits.has(e.id) }));
+    const names = await this.profiles(shown.map((e) => e.pubkey));
+    return { channelId, rootId, messages: shown, reactions, names, at: Date.now() };
   }
   async threads(channelId, limit = 80) {
     const events = (await this.query([{ kinds: [KIND_MESSAGE], "#h": [channelId], limit }])).sort(byTime);
@@ -7783,18 +7820,86 @@ function withoutReactions(source, ids) {
   return { ...source, reactions: source.reactions.filter((event) => !ids.has(event.id)) };
 }
 
+// src/markdown.ts
+var URL = /\bhttps?:\/\/[^\s<>()]+[^\s<>().,;:!?'"]/g;
+function linkify(h, text3, key) {
+  const out = [];
+  let last = 0;
+  for (const match of text3.matchAll(URL)) {
+    const at = match.index ?? 0;
+    if (at > last) out.push(text3.slice(last, at));
+    out.push(h("a", { key: `${key}-${at}`, href: match[0], target: "_blank", rel: "noreferrer" }, match[0]));
+    last = at + match[0].length;
+  }
+  if (last < text3.length) out.push(text3.slice(last));
+  return out;
+}
+function render(h, node2, key) {
+  const kids = () => "children" in node2 ? node2.children.map((child, i) => render(h, child, `${key}.${i}`)) : [];
+  switch (node2.type) {
+    case "root":
+      return h("div", { key, className: "bv-md" }, ...kids());
+    case "paragraph":
+      return h("p", { key }, ...kids());
+    case "text":
+      return h("span", { key }, ...linkify(h, node2.value, key));
+    case "strong":
+      return h("strong", { key }, ...kids());
+    case "emphasis":
+      return h("em", { key }, ...kids());
+    case "delete":
+      return h("del", { key }, ...kids());
+    case "inlineCode":
+      return h("code", { key }, node2.value);
+    case "code":
+      return h("pre", { key }, h("code", null, node2.value));
+    case "link":
+      return h("a", { key, href: node2.url, target: "_blank", rel: "noreferrer" }, ...kids());
+    case "image":
+      return h("a", { key, href: node2.url, target: "_blank", rel: "noreferrer" }, node2.alt || node2.url);
+    case "heading":
+      return h("p", { key, className: "bv-md-heading" }, ...kids());
+    case "blockquote":
+      return h("blockquote", { key }, ...kids());
+    case "list":
+      return h(node2.ordered ? "ol" : "ul", { key, start: node2.ordered ? node2.start ?? void 0 : void 0 }, ...kids());
+    case "listItem":
+      return h("li", { key }, node2.checked == null ? null : node2.checked ? "\u2611 " : "\u2610 ", ...kids());
+    case "break":
+      return h("br", { key });
+    case "thematicBreak":
+      return h("hr", { key });
+    case "html":
+      return h("span", { key }, node2.value);
+    default:
+      return "value" in node2 && typeof node2.value === "string" ? h("span", { key }, node2.value) : h("span", { key }, ...kids());
+  }
+}
+function markdown(h, text3) {
+  try {
+    return render(h, fromMarkdown(text3), "md");
+  } catch {
+    return h("p", { className: "bv-md" }, text3);
+  }
+}
+
 // src/ui.ts
 var TAP_MS = 400;
 var FLAG_REFRESH_MS = 6e4;
 var PENDING_MS = 5 * 6e4;
+var PREVIEW_DWELL_MS = 150;
+var PREVIEW_REFRESH_MS = 3e4;
 var VIEW_KEY = "buzz-voice-plugin.view";
-var DEFAULT_VIEW = { tab: "talk", mineOnly: false, emoji: null, open: null, scroll: 0 };
+var DEFAULT_VIEW = { tab: "talk", mineOnly: false, emoji: null, open: null, scroll: 0, selected: null };
 var SETTINGS_SECTION = "blueoi.buzz-voice/settings";
 function scopeOf(connection) {
   const scope = connection.scope ?? "";
   const at = scope.lastIndexOf(":");
   if (at < 0 || scope.slice(at + 1) !== connection.viewer) return void 0;
   return { communityOrigin: scope.slice(0, at), viewer: connection.viewer };
+}
+function stamp(seconds) {
+  return new Date(seconds * 1e3).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 function ago(seconds) {
   const delta = Math.max(0, Math.floor(Date.now() / 1e3) - seconds);
@@ -7805,7 +7910,7 @@ function ago(seconds) {
 }
 var CSS = `
 .bv-root{display:flex;flex-direction:column;height:100%;min-height:0}
-.bv-body{display:flex;flex-direction:column;flex:1;min-height:0}
+.bv-body{display:flex;flex-direction:column;flex:1;min-height:0;container:bv/inline-size}
 .bv-bar{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;padding:var(--space-2) var(--space-panel-inset)}
 .bv-segmented{width:100%;max-width:18rem}
 .bv-segmented[data-compact]{max-width:12rem}
@@ -7840,6 +7945,34 @@ var CSS = `
 .bv-type{display:flex;gap:var(--space-2);align-items:center}
 .bv-type>.buzz-input{flex:1;min-width:0}
 .bv-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 var(--space-panel-inset) var(--space-6)}
+.bv-split{display:flex;flex:1;min-height:0;border-top:1px solid var(--border-standard)}
+.bv-list{flex:none;width:clamp(16rem,38%,26rem);border-right:1px solid var(--border-standard);padding-top:var(--space-1)}
+.bv-flags:focus-visible{outline:2px solid var(--focus-ring, var(--affordance-accent-prominent));outline-offset:-2px}
+.bv-flag[data-selected] .bv-flag-open{background:var(--surface-inset)}
+.bv-preview{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+.bv-preview>.buzz-empty-state{margin:auto}
+.bv-preview-head{flex:none;display:flex;align-items:center;gap:var(--space-2);padding:var(--space-3) var(--space-panel-inset);border-bottom:1px solid var(--border-standard)}
+.bv-preview-body{flex:1;min-height:0;overflow-y:auto;padding:var(--space-2) var(--space-panel-inset) var(--space-6)}
+.bv-lines{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:var(--space-1)}
+.bv-line{display:flex;gap:var(--space-3);padding:var(--space-2);border-radius:var(--radius-row);cursor:pointer}
+.bv-line:hover{background:var(--affordance-row-hover)}
+.bv-line[data-hit]{background:var(--surface-inset);box-shadow:inset 3px 0 0 var(--affordance-accent-prominent)}
+.bv-avatar{flex:none;display:flex;align-items:center;justify-content:center;width:2rem;height:2rem;border-radius:50%;background:var(--surface-inset);color:var(--text-subtle);font-size:.75rem;font-weight:600}
+.bv-line-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:var(--space-half)}
+.bv-line-meta{display:flex;align-items:baseline;gap:var(--space-2)}
+.bv-md{overflow-wrap:anywhere}
+.bv-md>*{margin:0}
+.bv-md>*+*{margin-top:var(--space-2)}
+.bv-md ul,.bv-md ol{padding-left:1.25rem}
+.bv-md li>p{margin:0}
+.bv-md pre{padding:var(--space-2);border-radius:var(--radius-chip);background:var(--surface-inset);overflow-x:auto;white-space:pre}
+.bv-md code{font-family:var(--font-mono, ui-monospace, monospace);font-size:.875em}
+.bv-md blockquote{padding-left:var(--space-3);border-left:3px solid var(--border-standard);color:var(--text-subtle)}
+.bv-md a{color:var(--text-accent, inherit);text-decoration:underline}
+.bv-md-heading{font-weight:600}
+.bv-reactions{display:flex;flex-wrap:wrap;gap:var(--space-1);margin-top:var(--space-1)}
+.bv-reaction{padding:0 var(--space-2);border:1px solid var(--border-standard);border-radius:var(--radius-pill)}
+@container bv (max-width: 44rem){.bv-split{flex-direction:column}.bv-list{width:auto;height:40%;border-right:0;border-bottom:1px solid var(--border-standard)}}
 .bv-flags{list-style:none;margin:0;padding:0}
 .bv-flag{display:flex;flex-direction:column;gap:var(--space-1);border-bottom:1px solid var(--border-standard);padding:var(--space-1) 0}
 .bv-flag-main{display:flex;align-items:flex-start;gap:var(--space-2)}
@@ -7869,13 +8002,14 @@ var ICON = {
 function createUi(deps) {
   const { React, controller, relayService, navigation } = deps;
   const h = React.createElement;
-  const { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, useCallback } = React;
+  const { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, useCallback } = React;
   const view = { ...DEFAULT_VIEW, ...loadJson(VIEW_KEY, {}), open: null, scroll: 0 };
   const saveView = (patch) => {
     Object.assign(view, patch);
-    saveJson(VIEW_KEY, { tab: view.tab, mineOnly: view.mineOnly, emoji: view.emoji });
+    saveJson(VIEW_KEY, { tab: view.tab, mineOnly: view.mineOnly, emoji: view.emoji, selected: view.selected });
   };
   let flagCache = null;
+  const threadCache = /* @__PURE__ */ new Map();
   const pending = { added: /* @__PURE__ */ new Map(), removed: /* @__PURE__ */ new Map() };
   const overlay = (loaded) => {
     const now2 = Date.now();
@@ -8390,6 +8524,121 @@ function createUi(deps) {
       )
     );
   }
+  function initials(name) {
+    const parts = name.trim().split(/\s+/).filter(Boolean);
+    return ((parts[0]?.[0] ?? "?") + (parts.length > 1 ? parts.at(-1)?.[0] ?? "" : "")).toUpperCase();
+  }
+  function Preview({ relay, flag, following }) {
+    const [thread, setThread] = useState(flag && threadCache.get(flag.rootId) || null);
+    const [error, setError] = useState("");
+    const body = useRef(null);
+    const placed = useRef("");
+    useEffect(() => {
+      if (!flag) return;
+      let live = true;
+      setThread(threadCache.get(flag.rootId) ?? null);
+      setError("");
+      const load = () => relay.fullThread(flag.channelId, flag.rootId).then((next) => {
+        threadCache.set(flag.rootId, next);
+        if (live) setThread(next);
+      }).catch((cause) => live && setError(`Could not load the thread: ${cause?.message ?? cause}`));
+      const first = setTimeout(load, threadCache.has(flag.rootId) ? 0 : PREVIEW_DWELL_MS);
+      const poll = setInterval(load, PREVIEW_REFRESH_MS);
+      return () => {
+        live = false;
+        clearTimeout(first);
+        clearInterval(poll);
+      };
+    }, [relay, flag?.rootId, flag?.channelId]);
+    const shown = thread && flag && thread.rootId === flag.rootId ? thread : null;
+    useLayoutEffect(() => {
+      if (!shown || !flag || !body.current || placed.current === flag.rootId) return;
+      placed.current = flag.rootId;
+      const hit = flag.messageId !== flag.rootId ? body.current.querySelector(`[data-id="${flag.messageId}"]`) : null;
+      body.current.scrollTop = hit ? Math.max(0, hit.offsetTop - body.current.clientHeight / 3) : 0;
+    }, [shown, flag?.rootId]);
+    if (!flag) return h("div", { className: "bv-preview" }, h(EmptyState, { icon: "flag", title: "Nothing selected", description: "Pick a thread to read it here." }));
+    const open = (messageId) => (event) => {
+      if (event.target.closest?.("a")) return;
+      if (String(window.getSelection?.() ?? "").trim()) return;
+      openTarget(flag.channelId, messageId, flag.rootId);
+    };
+    return h(
+      "div",
+      { className: "bv-preview", "aria-label": "Thread preview" },
+      h(
+        "div",
+        { className: "bv-preview-head" },
+        h(
+          "div",
+          { className: "bv-flag-text", style: { flex: 1 } },
+          h("span", { className: "text-label text-standard bv-truncate" }, flag.title),
+          h(
+            "span",
+            { className: "text-caption text-subtle bv-truncate" },
+            `#${flag.channelName}${shown ? ` \xB7 ${shown.messages.length} ${shown.messages.length === 1 ? "message" : "messages"}` : ""}`
+          )
+        ),
+        h(
+          Button,
+          {
+            variant: following ? "prominent" : "subtle",
+            size: "sm",
+            "aria-pressed": following,
+            onClick: () => following ? controller.unwatch(flag.rootId) : controller.watch({ rootId: flag.rootId, channelId: flag.channelId, channelName: flag.channelName, label: flag.title, since: Math.floor(Date.now() / 1e3) })
+          },
+          following ? "Following" : "Follow"
+        ),
+        h(Button, { variant: "subtle", size: "sm", onClick: () => openTarget(flag.channelId, flag.messageId, flag.rootId) }, "Open")
+      ),
+      h(
+        "div",
+        { className: "bv-preview-body", ref: body },
+        error && !shown ? h("p", { className: "text-body-sm text-danger", role: "alert" }, error) : !shown ? h("p", { className: "text-body-sm text-subtle" }, "Loading thread...") : h(
+          "ol",
+          { className: "bv-lines" },
+          shown.messages.map((message2) => {
+            const name = shown.names.get(message2.pubkey) ?? message2.pubkey.slice(0, 8);
+            const reactions = [...shown.reactions.get(message2.id)?.entries() ?? []];
+            return h(
+              "li",
+              {
+                key: message2.id,
+                className: "bv-line",
+                "data-id": message2.id,
+                "data-hit": message2.id === flag.messageId || void 0,
+                title: "Click to open in Buzz",
+                onClick: open(message2.id)
+              },
+              h("span", { className: "bv-avatar", "aria-hidden": true }, initials(name)),
+              h(
+                "div",
+                { className: "bv-line-body" },
+                h(
+                  "div",
+                  { className: "bv-line-meta" },
+                  h("span", { className: "text-label-sm text-standard" }, name),
+                  h("span", { className: "text-caption text-subtle" }, stamp(message2.created_at), message2.edited ? " \xB7 edited" : "")
+                ),
+                h("div", { className: "text-body-sm text-standard" }, markdown(h, message2.content)),
+                reactions.length > 0 && h(
+                  "div",
+                  { className: "bv-reactions" },
+                  reactions.map(
+                    ([emoji, who]) => h(
+                      "span",
+                      { key: emoji, className: "bv-reaction text-caption", title: who.map((p) => shown.names.get(p) ?? p.slice(0, 8)).join(", ") },
+                      `${emoji} ${who.length}`
+                    )
+                  )
+                )
+              )
+            );
+          })
+        )
+      )
+    );
+  }
   function Flags({ relay, cacheKey }) {
     const voice = useVoice();
     const cached = flagCache?.key === cacheKey ? flagCache.source : null;
@@ -8421,7 +8670,7 @@ function createUi(deps) {
       setOpen(next);
     };
     const load = useCallback(() => {
-      setStatus2((current) => current === "loading" ? current : "refreshing");
+      setStatus2((current2) => current2 === "loading" ? current2 : "refreshing");
       loadFlags(relay).then((next) => {
         setSource(overlay(next));
         setStatus2("");
@@ -8439,19 +8688,19 @@ function createUi(deps) {
     const toggleFlag = (flag, e) => {
       setError("");
       try {
-        const current = flagCache?.key === cacheKey ? flagCache.source : source;
-        const existing = myFlags(current, flag.rootId).filter((event) => emojiOfFlag(event) === e);
+        const current2 = flagCache?.key === cacheKey ? flagCache.source : source;
+        const existing = myFlags(current2, flag.rootId).filter((event) => emojiOfFlag(event) === e);
         if (existing.length) {
           relay.unreact(existing, flag.channelId);
           const ids = new Set(existing.map((event) => event.id));
           for (const id of ids) pending.removed.set(id, Date.now());
-          setSource(withoutReactions(current, ids));
+          setSource(withoutReactions(current2, ids));
         } else {
-          const target = current.messages.get(flag.rootId) ?? current.messages.get(flag.messageId);
+          const target = current2.messages.get(flag.rootId) ?? current2.messages.get(flag.messageId);
           if (!target) throw new Error("That thread is not loaded yet.");
           const reaction = relay.react(target, e);
           pending.added.set(reaction.id, { event: reaction, at: Date.now() });
-          setSource(withReaction(current, reaction));
+          setSource(withReaction(current2, reaction));
         }
       } catch (cause) {
         setError(cause?.message ?? String(cause));
@@ -8462,6 +8711,25 @@ function createUi(deps) {
     const total = useMemo(() => groupFlags(source, channelNames, { mineOnly, emoji: null }).length, [source, channelNames, mineOnly]);
     const flags = useMemo(() => groupFlags(source, channelNames, { mineOnly, emoji }), [source, channelNames, mineOnly, emoji]);
     const palette = useMemo(() => [.../* @__PURE__ */ new Set([...DEFAULT_FLAGS, ...counts.map(([e]) => e)])], [counts]);
+    const [selected2, setSelected] = useState(view.selected);
+    const current = flags.find((flag) => flag.rootId === selected2) ?? flags[0];
+    const select = (rootId) => {
+      saveView({ selected: rootId });
+      setSelected(rootId);
+    };
+    const onListKey = (event) => {
+      if (!flags.length) return;
+      const at = Math.max(0, flags.findIndex((flag) => flag.rootId === current?.rootId));
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const next = flags[Math.min(flags.length - 1, Math.max(0, at + (event.key === "ArrowDown" ? 1 : -1)))];
+        select(next.rootId);
+        scroller.current?.querySelector(`[data-root="${next.rootId}"]`)?.scrollIntoView?.({ block: "nearest" });
+      } else if (event.key === "Enter" && current) {
+        event.preventDefault();
+        openTarget(current.channelId, current.messageId, current.rootId);
+      }
+    };
     const canFlag = relay.canReact();
     const failed = status && status !== "loading" && status !== "refreshing";
     return h(
@@ -8505,70 +8773,65 @@ function createUi(deps) {
       error && h("p", { className: "text-caption text-danger", role: "alert", style: { margin: 0, padding: "0 var(--space-panel-inset)" } }, error),
       h(
         "div",
-        {
-          className: "bv-scroll",
-          ref: scroller,
-          onScroll: (event) => {
-            view.scroll = event.currentTarget.scrollTop;
-          }
-        },
-        status === "loading" ? h("p", { className: "text-body-sm text-subtle" }, "Reading reactions...") : failed ? h("p", { className: "text-body-sm text-danger", role: "alert" }, status) : flags.length === 0 ? h(EmptyState, { icon: "flag", title: "No flagged threads", description: mineOnly ? "Threads you react to show up here." : "Threads with reactions show up here." }) : h(
-          "ul",
-          { className: "bv-flags" },
-          flags.map((flag) => {
-            const following = voice.watches.some((w) => w.rootId === flag.rootId);
-            const mine = [...new Set(myFlags(source, flag.rootId).map(emojiOfFlag))];
-            const picking = open === flag.rootId;
-            return h(
-              "li",
-              { key: flag.rootId, className: "bv-flag" },
-              h(
-                "div",
-                { className: "bv-flag-main" },
+        { className: "bv-split" },
+        h(
+          "div",
+          {
+            className: "bv-scroll bv-list",
+            ref: scroller,
+            onScroll: (event) => {
+              view.scroll = event.currentTarget.scrollTop;
+            }
+          },
+          status === "loading" ? h("p", { className: "text-body-sm text-subtle" }, "Reading reactions...") : failed ? h("p", { className: "text-body-sm text-danger", role: "alert" }, status) : flags.length === 0 ? h(EmptyState, { icon: "flag", title: "No flagged threads", description: mineOnly ? "Threads you react to show up here." : "Threads with reactions show up here." }) : h(
+            "ul",
+            { className: "bv-flags", role: "listbox", "aria-label": "Flagged threads", tabIndex: 0, onKeyDown: onListKey },
+            flags.map((flag) => {
+              const mine = [...new Set(myFlags(source, flag.rootId).map(emojiOfFlag))];
+              const picking = open === flag.rootId;
+              return h(
+                "li",
+                { key: flag.rootId, className: "bv-flag", role: "option", "aria-selected": flag.rootId === current?.rootId, "data-selected": flag.rootId === current?.rootId ? "" : void 0, "data-root": flag.rootId },
                 h(
-                  "button",
-                  { type: "button", className: "bv-flag-open", onClick: () => openTarget(flag.channelId, flag.messageId, flag.rootId) },
-                  h("span", { className: "bv-flag-emoji" }, flag.emoji.join("")),
+                  "div",
+                  { className: "bv-flag-main" },
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      className: "bv-flag-open",
+                      tabIndex: -1,
+                      title: "Double-click to open in Buzz",
+                      onClick: () => select(flag.rootId),
+                      onDoubleClick: () => openTarget(flag.channelId, flag.messageId, flag.rootId)
+                    },
+                    h("span", { className: "bv-flag-emoji" }, flag.emoji.join("")),
+                    h(
+                      "span",
+                      { className: "bv-flag-text" },
+                      h("span", { className: "text-label-sm text-standard bv-truncate" }, flag.title),
+                      flag.excerpt && h("span", { className: "text-body-sm text-subtle bv-truncate" }, flag.excerpt),
+                      h("span", { className: "text-caption text-subtle bv-truncate" }, `#${flag.channelName} \xB7 ${flag.who.join(", ")} \xB7 ${ago(flag.at)}`)
+                    )
+                  ),
                   h(
                     "span",
-                    { className: "bv-flag-text" },
-                    h("span", { className: "text-label-sm text-standard bv-truncate" }, flag.title),
-                    flag.excerpt && h("span", { className: "text-body-sm text-subtle bv-truncate" }, flag.excerpt),
-                    h("span", { className: "text-caption text-subtle bv-truncate" }, `#${flag.channelName} \xB7 ${flag.who.join(", ")} \xB7 ${ago(flag.at)}`)
+                    { className: "bv-flag-side" },
+                    canFlag && h(IconButton, {
+                      label: picking ? "Close flags" : mine.length ? `Your flags: ${mine.join(" ")}` : "Flag or unflag",
+                      icon: "flag",
+                      "aria-expanded": picking,
+                      "data-mine": mine.length ? "" : void 0,
+                      onClick: () => toggleOpen(flag.rootId)
+                    })
                   )
                 ),
-                h(
-                  "span",
-                  { className: "bv-flag-side" },
-                  canFlag && h(IconButton, {
-                    label: picking ? "Close flags" : mine.length ? `Your flags: ${mine.join(" ")}` : "Flag or unflag",
-                    icon: "flag",
-                    "aria-expanded": picking,
-                    "data-mine": mine.length ? "" : void 0,
-                    onClick: () => toggleOpen(flag.rootId)
-                  }),
-                  h(
-                    Button,
-                    {
-                      variant: following ? "prominent" : "subtle",
-                      size: "sm",
-                      "aria-pressed": following,
-                      onClick: () => following ? controller.unwatch(flag.rootId) : controller.watch({
-                        rootId: flag.rootId,
-                        channelId: flag.channelId,
-                        channelName: flag.channelName,
-                        label: flag.title,
-                        since: Math.floor(Date.now() / 1e3)
-                      })
-                    },
-                    following ? "Following" : "Follow"
-                  )
-                )
-              ),
-              picking && h(FlagPicker, { flag, mine, palette, onToggle: (e) => toggleFlag(flag, e) })
-            );
-          })
-        )
+                picking && h(FlagPicker, { flag, mine, palette, onToggle: (e) => toggleFlag(flag, e) })
+              );
+            })
+          )
+        ),
+        h(Preview, { relay, flag: current, following: !!current && voice.watches.some((w) => w.rootId === current.rootId) })
       )
     );
   }

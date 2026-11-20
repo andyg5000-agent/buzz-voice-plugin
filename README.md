@@ -21,7 +21,9 @@ app works.
   list the Todos panel edits. Assigning someone also mentions them in the
   thread, because an assignment alone does not wake an agent.
 - **Flags.** Every thread that carries a reaction, grouped by emoji with counts,
-  for everyone or just yours. Open a thread in Buzz, follow it, or use the
+  for everyone or just yours. Pick a thread to read the whole conversation in
+  a preview beside the list (arrow keys move through threads). Click a message
+  or Open to jump to it in Buzz, follow the thread, or use the
   flag button to add or remove your own reactions. The tab, filters and scroll
   position are kept when you leave the page and come back.
 

@@ -3,6 +3,7 @@ import { rootOf, type Channel, type Event, type Member, type Thread } from "./ty
 const KIND_MESSAGE = 9;
 const KIND_REACTION = 7;
 const KIND_DELETE = 5;
+const KIND_EDIT = 40003;
 const CHUNK = 50;
 const READ_LIMIT = 500;
 
@@ -37,6 +38,15 @@ export interface Session {
     supports(kind: number): boolean;
     send(event: { kind: number; content: string; tags: string[][] }): string;
   };
+}
+
+export interface ThreadView {
+  channelId: string;
+  rootId: string;
+  messages: (Event & { edited: boolean })[];
+  reactions: Map<string, Map<string, string[]>>;
+  names: Map<string, string>;
+  at: number;
 }
 
 export interface CanvasHead {
@@ -92,6 +102,45 @@ export class Relay {
   async messagesInThread(channelId: string, rootId: string): Promise<Event[]> {
     const events = await this.query([{ kinds: [KIND_MESSAGE], "#h": [channelId], "#e": [rootId], limit: 200 }]);
     return events.sort(byTime);
+  }
+
+  /** A thread as Buzz shows it: root first, latest edits applied, deletions dropped, reactions counted. */
+  async fullThread(channelId: string, rootId: string): Promise<ThreadView> {
+    const [replies, roots] = await Promise.all([
+      this.query([{ kinds: [KIND_MESSAGE], "#h": [channelId], "#e": [rootId], limit: READ_LIMIT }]),
+      this.byIds([rootId]),
+    ]);
+    const messages = [...roots, ...replies.filter((e) => e.id !== rootId)].sort(byTime);
+    const ids = messages.map((e) => e.id);
+    const related: Event[] = [];
+    for (const batch of chunk(ids, CHUNK)) {
+      related.push(...(await this.query([{ kinds: [KIND_EDIT, KIND_REACTION], "#e": batch, limit: READ_LIMIT }])));
+    }
+    const gone = await this.deleted([...ids, ...related.map((e) => e.id)]);
+    const edits = new Map<string, Event>();
+    const reactions = new Map<string, Map<string, string[]>>();
+    for (const event of related.sort(byTime)) {
+      if (gone.has(event.id)) continue;
+      const target = event.tags.filter((t) => t[0] === "e" && t[1]).at(-1)?.[1];
+      if (!target) continue;
+      if (event.kind === KIND_EDIT) {
+        const original = messages.find((m) => m.id === target);
+        if (original && original.pubkey === event.pubkey) edits.set(target, event);
+        continue;
+      }
+      const emoji = event.content.replace(/\uFE0F/g, "").trim();
+      if (!emoji || emoji === "-") continue;
+      const byEmoji = reactions.get(target) ?? new Map<string, string[]>();
+      const who = byEmoji.get(emoji) ?? [];
+      if (!who.includes(event.pubkey)) who.push(event.pubkey);
+      byEmoji.set(emoji, who);
+      reactions.set(target, byEmoji);
+    }
+    const shown = messages
+      .filter((e) => !gone.has(e.id))
+      .map((e) => ({ ...e, content: edits.get(e.id)?.content ?? e.content, edited: edits.has(e.id) }));
+    const names = await this.profiles(shown.map((e) => e.pubkey));
+    return { channelId, rootId, messages: shown, reactions, names, at: Date.now() };
   }
 
   async threads(channelId: string, limit = 80): Promise<Thread[]> {
