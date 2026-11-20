@@ -1,10 +1,35 @@
 import { mentionsIn, type Controller, type LogEntry, type VoiceState } from "./controller";
-import { listMicrophones, type Settings } from "./engine";
-import { emojiCounts, emptyFlagSource, groupFlags, loadFlags, type Flag, type FlagSource } from "./flags";
+import { listMicrophones, loadJson, saveJson, type Settings } from "./engine";
+import {
+  DEFAULT_FLAGS,
+  emojiCounts,
+  emojiOfFlag,
+  emptyFlagSource,
+  groupFlags,
+  loadFlags,
+  myFlags,
+  withReaction,
+  withoutReactions,
+  type Flag,
+  type FlagSource,
+} from "./flags";
 import type { Relay } from "./relay";
+import type { Event } from "./types";
 
 const TAP_MS = 400;
 const FLAG_REFRESH_MS = 60_000;
+const PENDING_MS = 5 * 60_000;
+const VIEW_KEY = "buzz-voice-plugin.view";
+
+interface View {
+  tab: string;
+  mineOnly: boolean;
+  emoji: string | null;
+  open: string | null;
+  scroll: number;
+}
+
+const DEFAULT_VIEW: View = { tab: "talk", mineOnly: false, emoji: null, open: null, scroll: 0 };
 const SETTINGS_SECTION = "blueoi.buzz-voice/settings";
 
 export interface Connection {
@@ -77,13 +102,16 @@ const CSS = `
 .bv-type>.buzz-input{flex:1;min-width:0}
 .bv-scroll{flex:1;min-height:0;overflow-y:auto;padding:0 var(--space-panel-inset) var(--space-6)}
 .bv-flags{list-style:none;margin:0;padding:0}
-.bv-flag{display:flex;align-items:flex-start;gap:var(--space-2);border-bottom:1px solid var(--border-standard);padding:var(--space-1) 0}
+.bv-flag{display:flex;flex-direction:column;gap:var(--space-1);border-bottom:1px solid var(--border-standard);padding:var(--space-1) 0}
+.bv-flag-main{display:flex;align-items:flex-start;gap:var(--space-2)}
+.bv-flag-picker{display:flex;align-items:center;gap:var(--space-1);flex-wrap:wrap;padding:0 var(--space-2) var(--space-2) calc(2.75rem + var(--space-3) + var(--space-2))}
+.bv-flag-side [data-mine]{color:var(--text-accent, var(--affordance-accent-prominent))}
 .bv-flag:last-child{border-bottom:0}
 .bv-flag-open{display:flex;gap:var(--space-3);flex:1;min-width:0;padding:var(--space-2);border:0;border-radius:var(--radius-row);background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .bv-flag-open:hover{background:var(--affordance-row-hover)}
 .bv-flag-emoji{flex:none;min-width:2.75rem;white-space:nowrap;font-size:1.125rem;line-height:1.5rem}
 .bv-flag-text{display:flex;flex-direction:column;gap:var(--space-half);min-width:0}
-.bv-flag-side{flex:none;padding-top:var(--space-1)}
+.bv-flag-side{flex:none;display:flex;align-items:center;gap:var(--space-1);padding-top:var(--space-1)}
 .bv-settings{display:flex;flex-direction:column}
 .bv-settings>.buzz-content-header[data-inline]{margin-top:var(--space-section-gap);margin-bottom:var(--space-2)}
 .bv-form{display:flex;flex-direction:column;gap:var(--space-4)}
@@ -105,6 +133,22 @@ export function createUi(deps: UiDeps) {
   const { React, controller, relayService, navigation } = deps;
   const h = React.createElement;
   const { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, useCallback } = React;
+
+  const view: View = { ...DEFAULT_VIEW, ...loadJson(VIEW_KEY, {}), open: null, scroll: 0 };
+  const saveView = (patch: Partial<View>) => {
+    Object.assign(view, patch);
+    saveJson(VIEW_KEY, { tab: view.tab, mineOnly: view.mineOnly, emoji: view.emoji });
+  };
+  let flagCache: { key: string; source: FlagSource } | null = null;
+  const pending = { added: new Map<string, { event: Event; at: number }>(), removed: new Map<string, number>() };
+  const overlay = (loaded: FlagSource): FlagSource => {
+    const now = Date.now();
+    for (const [id, at] of pending.removed) if (now - at > PENDING_MS) pending.removed.delete(id);
+    for (const [id, item] of pending.added) if (now - item.at > PENDING_MS) pending.added.delete(id);
+    const have = new Set(loaded.reactions.map((event) => event.id));
+    const extra = [...pending.added.values()].map((item) => item.event).filter((event) => !have.has(event.id));
+    return { ...loaded, reactions: [...extra, ...loaded.reactions].filter((event) => !pending.removed.has(event.id)) };
+  };
 
   const useVoice = (): VoiceState => useSyncExternalStore(controller.subscribe, controller.snapshot, controller.snapshot);
   const useConnection = (): Connection =>
@@ -295,7 +339,7 @@ export function createUi(deps: UiDeps) {
       title: "Set up speech",
       description: voice.engineError
         ? voice.engineError
-        : `Speech is transcribed on this Mac with sherpa-onnx, the same as the Buzz Voice app. ${missing ? `Install ${missing} to start.` : "Checking for the engine..."}`,
+        : `Speech is transcribed on this computer with sherpa-onnx, the same as the Buzz Voice app. ${missing ? `Install ${missing} to start.` : "Checking for the engine..."}`,
       action: h(
         "div",
         { className: "bv-row", style: { justifyContent: "center" } },
@@ -351,6 +395,7 @@ export function createUi(deps: UiDeps) {
     const found = mentionsIn(pending.body, pending.members);
     const unmatched = found.length === 0 && pending.body.includes("@");
     const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (pending.todo) return h(TodoConfirm, { voice, found });
     return h(
       "div",
       { className: "bv-card", role: "group", "aria-label": "Confirm message" },
@@ -422,6 +467,108 @@ export function createUi(deps: UiDeps) {
         h(Button, { variant: "subtle", onClick: () => controller.cancel() }, "Cancel"),
         h(Button, { variant: "prominent", onClick: () => void controller.publish() }, "Send"),
       ),
+    );
+  }
+
+  function TodoConfirm({ voice, found }: { voice: VoiceState; found: { name: string }[] }) {
+    const pending = voice.pending!;
+    const todo = pending.todo!;
+    const verbs = { add: "Add todo", assign: "Assign todo", start: "Start todo", done: "Mark done", reopen: "Reopen todo" };
+    const assigning = todo.op === "add" || todo.op === "assign";
+    const keys = (event: any) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        void controller.publish();
+      }
+      if (event.key === "Escape") controller.cancel();
+    };
+    return h(
+      "div",
+      { className: "bv-card", role: "group", "aria-label": "Confirm todo" },
+      h(
+        "div",
+        { className: "bv-row" },
+        h("span", { className: "text-label-sm text-standard" }, `${verbs[todo.op]} in #${pending.channel.name}`),
+        pending.body && pending.label && h("span", { className: "text-caption text-subtle bv-truncate" }, `tell in “${pending.label}”`),
+      ),
+      todo.op === "add"
+        ? h(Input, {
+            "aria-label": "Todo",
+            value: todo.label,
+            autoFocus: true,
+            onChange: (event: any) => controller.editTodoLabel(event.target.value),
+            onKeyDown: keys,
+          })
+        : h("div", { className: "bv-bubble text-body-sm", style: { background: "var(--surface-inset)" } }, todo.label),
+      assigning &&
+        h(
+          "div",
+          { className: "bv-row" },
+          h("span", { className: "text-caption text-subtle" }, "Assignee"),
+          [null, ...pending.members.slice(0, 8)].map((member) =>
+            h(
+              Button,
+              {
+                key: member?.pubkey ?? "nobody",
+                variant: (todo.assignee?.pubkey ?? null) === (member?.pubkey ?? null) ? "prominent" : "subtle",
+                size: "sm",
+                onClick: () => controller.assignPending(member),
+              },
+              member ? member.name : "Nobody",
+            ),
+          ),
+        ),
+      pending.body &&
+        h("textarea", {
+          "aria-label": "Message that notifies the assignee",
+          value: pending.body,
+          rows: 2,
+          spellCheck: false,
+          "data-buzz-ui": "",
+          className: "buzz-textarea",
+          "data-variant": "text",
+          "data-surface": "inset",
+          "data-appearance": "field",
+          style: { resize: "none" },
+          onChange: (event: any) => controller.editPending(event.target.value),
+          onKeyDown: keys,
+        }),
+      h(
+        "p",
+        { className: "text-caption text-subtle", style: { margin: 0 } },
+        found.length
+          ? `Saves to Canvas, then mentions ${found.map((m) => m.name).join(", ")} ${pending.replyTo ? "in the thread" : "in a new message"} so they pick it up.`
+          : "Saves to the channel's Canvas todos. Nobody is notified.",
+      ),
+      h(
+        "div",
+        { className: "bv-row-end" },
+        h("span", { className: "text-caption text-subtle", style: { marginRight: "auto" } }, "Enter or say “yes” to save"),
+        h(Button, { variant: "subtle", onClick: () => controller.cancel() }, "Cancel"),
+        h(Button, { variant: "prominent", onClick: () => void controller.publish() }, "Save"),
+      ),
+    );
+  }
+
+  function HandsFree({ voice }: { voice: VoiceState }) {
+    const word = voice.settings.wakeWord.trim() || "buzz";
+    const label = !voice.handsFree
+      ? "Hands-free off"
+      : voice.hearing
+        ? "Hearing you..."
+        : voice.awake
+          ? "Go ahead"
+          : `Say “hey ${word}”`;
+    return h(
+      "div",
+      { className: "bv-row", style: { justifyContent: "space-between" } },
+      h(
+        "span",
+        { className: "bv-row text-caption text-subtle" },
+        h("span", { className: "bv-dot", "data-state": voice.handsFree ? (voice.hearing || voice.awake ? "online" : "idle") : undefined }),
+        label,
+      ),
+      h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() }),
     );
   }
 
@@ -511,7 +658,7 @@ export function createUi(deps: UiDeps) {
             ? h(EmptyState, {
                 icon: "mic",
                 title: "Talk to Buzz",
-                description: "“In ops, tell build-bot to rerun the deploy.” “How is work going in ops?” “What’s in my inbox?”",
+                description: "“In ops, tell build-bot to rerun the deploy.” “Add a todo in ops for build-bot to rotate the keys.” “How is work going in ops?” “What’s in my inbox?”",
               })
             : null,
         voice.log.map((entry) => h(Turn, { key: entry.id, entry })),
@@ -521,11 +668,12 @@ export function createUi(deps: UiDeps) {
         "div",
         { className: "bv-footer" },
         h("div", { className: "bv-meter", "aria-hidden": true }, h("span", { style: { width: `${Math.round(level * 100)}%` } })),
+        voice.ready && voice.engine?.runtime && h(HandsFree, { voice }),
         h(TalkButton, { voice }),
         h(
           "p",
           { className: `bv-status text-caption ${voice.statusBad ? "text-danger" : "text-subtle"}`, role: voice.statusBad ? "alert" : "status" },
-          voice.status || (voice.ready ? "Or press ⌘⇧Space anywhere in Buzz" : ""),
+          voice.status || (voice.ready ? "Or press ⌘⇧Space anywhere in Buzz, ⌘⇧H for hands-free" : ""),
         ),
         h(
           "form",
@@ -550,30 +698,112 @@ export function createUi(deps: UiDeps) {
     );
   }
 
-  function Flags({ relay }: { relay: Relay }) {
+  function FlagPicker({ flag, mine, palette, onToggle }: { flag: Flag; mine: string[]; palette: string[]; onToggle(emoji: string): void }) {
+    const [custom, setCustom] = useState("");
+    const choices = [...new Set([...flag.emoji, ...palette])];
+    return h(
+      "div",
+      { className: "bv-flag-picker", role: "group", "aria-label": "Your flags on this thread" },
+      choices.map((e) =>
+        h(
+          Button,
+          { key: e, variant: mine.includes(e) ? "prominent" : "subtle", size: "sm", "aria-pressed": mine.includes(e), title: mine.includes(e) ? "Unflag" : "Flag", onClick: () => onToggle(e) },
+          e,
+        ),
+      ),
+      h(
+        "form",
+        {
+          className: "bv-row",
+          onSubmit: (event: any) => {
+            event.preventDefault();
+            const value = custom.replace(/\uFE0F/g, "").trim();
+            if (!value) return;
+            if (!mine.includes(value)) onToggle(value);
+            setCustom("");
+          },
+        },
+        h(Input, { "aria-label": "Other emoji", placeholder: "Other", value: custom, maxLength: 16, style: { width: "5rem" }, onChange: (event: any) => setCustom(event.target.value) }),
+        h(Button, { type: "submit", variant: "subtle", size: "sm", disabled: !custom.trim() }, "Add"),
+      ),
+    );
+  }
+
+  function Flags({ relay, cacheKey }: { relay: Relay; cacheKey: string }) {
     const voice = useVoice();
-    const [source, setSource] = useState(emptyFlagSource() as FlagSource);
-    const [status, setStatus] = useState("loading");
-    const [mineOnly, setMineOnly] = useState(false);
-    const [emoji, setEmoji] = useState(null as string | null);
+    const cached = flagCache?.key === cacheKey ? flagCache.source : null;
+    const [source, setSourceState] = useState((cached ?? emptyFlagSource()) as FlagSource);
+    const [status, setStatus] = useState(cached ? "" : "loading");
+    const [mineOnly, setMineOnlyState] = useState(view.mineOnly);
+    const [emoji, setEmojiState] = useState(view.emoji);
+    const [open, setOpen] = useState(view.open);
+    const [error, setError] = useState("");
+    const scroller = useRef(null as any);
+    const setSource = useCallback(
+      (next: FlagSource) => {
+        flagCache = { key: cacheKey, source: next };
+        setSourceState(next);
+      },
+      [cacheKey],
+    );
+    const setMineOnly = (next: boolean) => {
+      saveView({ mineOnly: next });
+      setMineOnlyState(next);
+    };
+    const setEmoji = (next: string | null) => {
+      saveView({ emoji: next });
+      setEmojiState(next);
+    };
+    const toggleOpen = (rootId: string) => {
+      const next = open === rootId ? null : rootId;
+      view.open = next;
+      setOpen(next);
+    };
     const load = useCallback(() => {
       setStatus((current: string) => (current === "loading" ? current : "refreshing"));
       loadFlags(relay)
         .then((next) => {
-          setSource(next);
+          setSource(overlay(next));
           setStatus("");
         })
         .catch((error) => setStatus(`Could not read reactions: ${error?.message ?? error}`));
-    }, [relay]);
+    }, [relay, setSource]);
     useEffect(() => {
       load();
       const timer = setInterval(load, FLAG_REFRESH_MS);
       return () => clearInterval(timer);
     }, [load]);
+    const ready = status !== "loading";
+    useEffect(() => {
+      if (ready && scroller.current) scroller.current.scrollTop = view.scroll;
+    }, [ready]);
+    const toggleFlag = (flag: Flag, e: string) => {
+      setError("");
+      try {
+        const current = flagCache?.key === cacheKey ? flagCache.source : source;
+        const existing = myFlags(current, flag.rootId).filter((event) => emojiOfFlag(event) === e);
+        if (existing.length) {
+          relay.unreact(existing, flag.channelId);
+          const ids = new Set(existing.map((event) => event.id));
+          for (const id of ids) pending.removed.set(id, Date.now());
+          setSource(withoutReactions(current, ids));
+        } else {
+          const target = current.messages.get(flag.rootId) ?? current.messages.get(flag.messageId);
+          if (!target) throw new Error("That thread is not loaded yet.");
+          const reaction = relay.react(target, e);
+          pending.added.set(reaction.id, { event: reaction, at: Date.now() });
+          setSource(withReaction(current, reaction));
+        }
+      } catch (cause: any) {
+        setError(cause?.message ?? String(cause));
+      }
+    };
     const channelNames = useMemo(() => new Map(relay.channels().map((c) => [c.id, c.name])), [relay, source]);
     const counts: [string, number][] = useMemo(() => emojiCounts(source, mineOnly), [source, mineOnly]);
     const total = useMemo(() => groupFlags(source, channelNames, { mineOnly, emoji: null }).length, [source, channelNames, mineOnly]);
     const flags: Flag[] = useMemo(() => groupFlags(source, channelNames, { mineOnly, emoji }), [source, channelNames, mineOnly, emoji]);
+    const palette = useMemo(() => [...new Set([...DEFAULT_FLAGS, ...counts.map(([e]) => e)])], [counts]);
+    const canFlag = relay.canReact();
     const failed = status && status !== "loading" && status !== "refreshing";
     return h(
       Fragment,
@@ -613,9 +843,16 @@ export function createUi(deps: UiDeps) {
           ),
         ),
       ),
+      error && h("p", { className: "text-caption text-danger", role: "alert", style: { margin: 0, padding: "0 var(--space-panel-inset)" } }, error),
       h(
         "div",
-        { className: "bv-scroll" },
+        {
+          className: "bv-scroll",
+          ref: scroller,
+          onScroll: (event: any) => {
+            view.scroll = event.currentTarget.scrollTop;
+          },
+        },
         status === "loading"
           ? h("p", { className: "text-body-sm text-subtle" }, "Reading reactions...")
           : failed
@@ -627,44 +864,59 @@ export function createUi(deps: UiDeps) {
                   { className: "bv-flags" },
                   flags.map((flag) => {
                     const following = voice.watches.some((w) => w.rootId === flag.rootId);
+                    const mine = [...new Set(myFlags(source, flag.rootId).map(emojiOfFlag))];
+                    const picking = open === flag.rootId;
                     return h(
                       "li",
                       { key: flag.rootId, className: "bv-flag" },
                       h(
-                        "button",
-                        { type: "button", className: "bv-flag-open", onClick: () => openTarget(flag.channelId, flag.messageId, flag.rootId) },
-                        h("span", { className: "bv-flag-emoji" }, flag.emoji.join("")),
+                        "div",
+                        { className: "bv-flag-main" },
+                        h(
+                          "button",
+                          { type: "button", className: "bv-flag-open", onClick: () => openTarget(flag.channelId, flag.messageId, flag.rootId) },
+                          h("span", { className: "bv-flag-emoji" }, flag.emoji.join("")),
+                          h(
+                            "span",
+                            { className: "bv-flag-text" },
+                            h("span", { className: "text-label-sm text-standard bv-truncate" }, flag.title),
+                            flag.excerpt && h("span", { className: "text-body-sm text-subtle bv-truncate" }, flag.excerpt),
+                            h("span", { className: "text-caption text-subtle bv-truncate" }, `#${flag.channelName} · ${flag.who.join(", ")} · ${ago(flag.at)}`),
+                          ),
+                        ),
                         h(
                           "span",
-                          { className: "bv-flag-text" },
-                          h("span", { className: "text-label-sm text-standard bv-truncate" }, flag.title),
-                          flag.excerpt && h("span", { className: "text-body-sm text-subtle bv-truncate" }, flag.excerpt),
-                          h("span", { className: "text-caption text-subtle bv-truncate" }, `#${flag.channelName} · ${flag.who.join(", ")} · ${ago(flag.at)}`),
+                          { className: "bv-flag-side" },
+                          canFlag &&
+                            h(IconButton, {
+                              label: picking ? "Close flags" : mine.length ? `Your flags: ${mine.join(" ")}` : "Flag or unflag",
+                              icon: "flag",
+                              "aria-expanded": picking,
+                              "data-mine": mine.length ? "" : undefined,
+                              onClick: () => toggleOpen(flag.rootId),
+                            }),
+                          h(
+                            Button,
+                            {
+                              variant: following ? "prominent" : "subtle",
+                              size: "sm",
+                              "aria-pressed": following,
+                              onClick: () =>
+                                following
+                                  ? controller.unwatch(flag.rootId)
+                                  : controller.watch({
+                                      rootId: flag.rootId,
+                                      channelId: flag.channelId,
+                                      channelName: flag.channelName,
+                                      label: flag.title,
+                                      since: Math.floor(Date.now() / 1000),
+                                    }),
+                            },
+                            following ? "Following" : "Follow",
+                          ),
                         ),
                       ),
-                      h(
-                        "span",
-                        { className: "bv-flag-side" },
-                        h(
-                          Button,
-                          {
-                            variant: following ? "prominent" : "subtle",
-                            size: "sm",
-                            "aria-pressed": following,
-                            onClick: () =>
-                              following
-                                ? controller.unwatch(flag.rootId)
-                                : controller.watch({
-                                    rootId: flag.rootId,
-                                    channelId: flag.channelId,
-                                    channelName: flag.channelName,
-                                    label: flag.title,
-                                    since: Math.floor(Date.now() / 1000),
-                                  }),
-                          },
-                          following ? "Following" : "Follow",
-                        ),
-                      ),
+                      picking && h(FlagPicker, { flag, mine, palette, onToggle: (e: string) => toggleFlag(flag, e) }),
                     );
                   }),
                 ),
@@ -675,7 +927,11 @@ export function createUi(deps: UiDeps) {
   function Page() {
     const connection = useConnection();
     const voice = useVoice();
-    const [tab, setTab] = useState("talk");
+    const [tab, setTabState] = useState(view.tab);
+    const setTab = (next: string) => {
+      saveView({ tab: next });
+      setTabState(next);
+    };
     const relay = useMemo(
       () => (connection.status === "ready" ? deps.relay() : null),
       [connection.scope, connection.generation, connection.status],
@@ -744,7 +1000,7 @@ export function createUi(deps: UiDeps) {
                 )
               : tab === "talk"
                 ? h(Talk, { voice })
-                : h(Flags, { key: `${connection.scope}:${connection.generation}`, relay }),
+                : h(Flags, { key: `${connection.scope}:${connection.generation}`, cacheKey: `${connection.scope}:${connection.generation}`, relay }),
           ),
         ),
       ),
@@ -909,6 +1165,30 @@ export function createUi(deps: UiDeps) {
           ),
         }),
       ),
+      h(
+        Group,
+        null,
+        h(Row, {
+          title: "Fast speech and hands-free",
+          subtitle: engine?.runtime
+            ? "Ready. Whisper stays loaded between sentences, and hands-free listens for the wake word."
+            : "Keeps whisper loaded so replies start sooner, and turns on hands-free. Needs python3; installs into the model folder.",
+          trailing: engine?.runtime
+            ? h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() })
+            : h(Button, { variant: "subtle", size: "sm", loading: !!voice.installing, disabled: !ready, onClick: () => void controller.install() }, "Install"),
+        }),
+        h(Row, {
+          title: "Wake word",
+          subtitle: `Say “hey ${settings.wakeWord.trim() || "buzz"}, ...” to give a command hands-free.`,
+          trailing: h(Input, {
+            "aria-label": "Wake word",
+            value: settings.wakeWord,
+            placeholder: "buzz",
+            style: { width: "10rem" },
+            onChange: (e: any) => controller.updateSettings({ wakeWord: e.target.value }),
+          }),
+        }),
+      ),
       h(Group, { layout: "form" }, h(SpeechForm, { settings })),
       h(Header, {
         inline: true,
@@ -945,6 +1225,7 @@ export function createUi(deps: UiDeps) {
         null,
         h(Row, { title: "Start or stop talking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧Space") }),
         h(Row, { title: "Stop speaking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧.") }),
+        h(Row, { title: "Hands-free on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧H") }),
       ),
     );
   }

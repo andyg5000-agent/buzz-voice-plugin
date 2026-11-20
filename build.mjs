@@ -12,12 +12,14 @@ const manifest = {
   name: "Buzz Voice",
   apiVersion: 1,
   description:
-    "Talk to Buzz: speak a task, confirm it, and it posts to the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
+    "Talk to Buzz, hands-free or push to talk: speak a task or a todo, confirm it, and it lands in the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
   discovery: { category: "productivity", tags: ["voice", "speech", "emoji"] },
   host: {
     processes: [
       { id: "stt", program: "sh", args: ["-c", script("stt"), "buzz-voice-stt"] },
       { id: "setup", program: "sh", args: ["-c", script("setup"), "buzz-voice-setup"] },
+      { id: "runtime", program: "sh", args: ["-c", script("runtime"), "buzz-voice-runtime"] },
+      { id: "listen", program: "sh", args: ["-c", script("listen"), "buzz-voice-listen"] },
       { id: "say", program: "say" },
       {
         id: "llm",
@@ -34,6 +36,7 @@ await build({
   format: "esm",
   target: "es2022",
   outfile: "plugin.js",
+  loader: { ".py": "text" },
   banner: { js: "// Built from src/ by build.mjs. Edit the TypeScript, then run npm run build." },
 });
 writeFileSync("manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);

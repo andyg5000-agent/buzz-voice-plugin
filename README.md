@@ -10,8 +10,20 @@ app works.
   press Enter to send. Questions are read back out loud. Threads you post to or
   ask about are watched for eight hours and new replies are read out as they
   land. You can also type instead of talking.
+- **Hands-free.** Turn it on (or press Cmd+Shift+H) and say "hey Buzz, ..."
+  followed by the command. The end of a sentence is found by voice activity
+  detection, so there is nothing to press. After Buzz speaks you have a few
+  seconds to answer without the wake word, which is how "yes" confirms a card.
+  The microphone is ignored while Buzz is speaking.
+- **Todos.** "In ops add a todo for build-bot to rerun the deploy", "mark the
+  deploy todo done", "assign the API keys todo to Bob", "what is on the todo
+  list in ops". Todos live in the channel Canvas under `## Todos`, the same
+  list the Todos panel edits. Assigning someone also mentions them in the
+  thread, because an assignment alone does not wake an agent.
 - **Flags.** Every thread that carries a reaction, grouped by emoji with counts,
-  for everyone or just yours. Open a thread in Buzz or follow it.
+  for everyone or just yours. Open a thread in Buzz, follow it, or use the
+  flag button to add or remove your own reactions. The tab, filters and scroll
+  position are kept when you leave the page and come back.
 
 ## What runs where
 
@@ -20,6 +32,11 @@ app works.
   standalone app uses. Audio never leaves the machine. If the engine or model is
   missing, the page offers an install button that downloads them from the
   sherpa-onnx GitHub releases.
+- Fast speech and hands-free use the sherpa-onnx Python package in a venv in
+  the same folder (`venv/`, plus `silero_vad.onnx`). One process keeps whisper
+  loaded and runs voice activity detection on the microphone stream, so
+  nothing is reloaded per sentence. Install it from Settings; it needs
+  `python3`. Without it, push to talk falls back to the one-shot engine.
 - Routing (which channel, thread and person) uses the Decisions API provider
   chosen in Buzz Settings when one is on, and falls back to the language model.
 - The language model writes the message body and reads channels back. Any
@@ -36,10 +53,14 @@ app works.
 | --- | --- |
 | `sh` (stt) | Decode the recorded audio with the local sherpa-onnx engine |
 | `sh` (setup) | Check for, or download, the engine and model |
+| `sh` (runtime) | Check for, or install, the Python speech runtime and VAD model |
+| `sh` (listen) | Run the long-lived recogniser in `scripts/listen.py` |
 | `say` | Speak replies |
 | `curl` (llm) | Call your language model, including plain http on a LAN |
 
-The scripts are in `scripts/` and embedded verbatim in `manifest.json`.
+The shell scripts are in `scripts/` and embedded verbatim in `manifest.json`.
+`scripts/listen.py` is bundled into `plugin.js` and passed to the listen
+process as its program text.
 
 ## Install
 

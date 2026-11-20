@@ -28,10 +28,21 @@ export interface Session {
     send(channelId: string, text: string): string;
     reply(channelId: string, rootId: string, text: string): string;
   };
+  canvas?: {
+    available: boolean;
+    read(channel: string): Promise<CanvasHead | null | undefined>;
+    save(channel: string, content: string, expected: string | undefined, options?: { preserveApproval: boolean }): Promise<CanvasHead>;
+  };
   outbox?: {
     supports(kind: number): boolean;
     send(event: { kind: number; content: string; tags: string[][] }): string;
   };
+}
+
+export interface CanvasHead {
+  id: string;
+  content: string;
+  created_at: number;
 }
 
 function chunk<T>(list: T[], size: number): T[][] {
@@ -170,6 +181,56 @@ export class Relay {
     const ids = [...new Set(roster)].filter((id) => id !== this.pubkey);
     const names = await this.profiles(ids);
     return ids.map((pubkey) => ({ pubkey, name: names.get(pubkey) ?? "" })).filter((m) => m.name);
+  }
+
+  async readCanvas(channelId: string): Promise<CanvasHead | null> {
+    const canvas = this.session.canvas;
+    if (!canvas) throw new Error("This Buzz build has no Canvas.");
+    return (await canvas.read(channelId)) ?? null;
+  }
+
+  /** Applies `edit` to the latest Canvas, retrying once if someone saved in between. */
+  async editCanvas(channelId: string, edit: (content: string) => string): Promise<CanvasHead> {
+    const canvas = this.session.canvas;
+    if (!canvas?.available) throw new Error("Canvas writing is unavailable here.");
+    for (let attempt = 0; ; attempt += 1) {
+      const head = (await canvas.read(channelId)) ?? null;
+      const next = edit(head?.content ?? "");
+      const wait = ((head?.created_at ?? 0) + 1) * 1000 - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, Math.min(wait, 1000)));
+      try {
+        return await canvas.save(channelId, next, head?.id, { preserveApproval: true });
+      } catch (error) {
+        if (attempt > 0 || !/Canvas changed/.test(String((error as Error)?.message))) throw error;
+      }
+    }
+  }
+
+  canReact(): boolean {
+    const outbox = this.session.outbox;
+    return !!outbox?.supports(KIND_REACTION) && outbox.supports(KIND_DELETE);
+  }
+
+  react(target: Event, emoji: string): Event {
+    const outbox = this.session.outbox;
+    const channelId = target.tags.find((t) => t[0] === "h")?.[1];
+    if (!outbox?.supports(KIND_REACTION) || !channelId) throw new Error("This Buzz connection cannot add reactions.");
+    const tags = [
+      ["h", channelId],
+      ["e", target.id],
+      ["p", target.pubkey],
+    ];
+    const id = outbox.send({ kind: KIND_REACTION, content: emoji, tags });
+    return { id, pubkey: this.pubkey, created_at: Math.floor(Date.now() / 1000), kind: KIND_REACTION, content: emoji, tags };
+  }
+
+  unreact(reactions: Event[], channelId: string): void {
+    const outbox = this.session.outbox;
+    if (!outbox?.supports(KIND_DELETE)) throw new Error("This Buzz connection cannot remove reactions.");
+    for (const reaction of reactions) {
+      if (reaction.pubkey !== this.pubkey) continue;
+      outbox.send({ kind: KIND_DELETE, content: "", tags: [["h", channelId], ["e", reaction.id], ["k", String(KIND_REACTION)]] });
+    }
   }
 
   postMessage(options: { channelId: string; content: string; replyTo?: string; mentions?: string[] }): {

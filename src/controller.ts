@@ -4,12 +4,15 @@ import {
   llmPoster,
   loadJson,
   loadSettings,
+  Listener,
   Recorder,
   saveJson,
   saveSettings,
   Speaker,
   transcribe,
+  pcmBase64,
   type EngineStatus,
+  type Heard,
   type Host,
   type Settings,
 } from "./engine";
@@ -20,7 +23,9 @@ import {
   summarizeInbox,
   type Intent,
   type LlmConfig,
+  type TodoOp,
 } from "./intent";
+import { addTodo, assignTodo, findTodo, readTodos, setStatus, type Status, type Todo } from "./todos";
 import { bestPerson, matchChannel } from "./match";
 import type { Relay } from "./relay";
 import {
@@ -46,7 +51,15 @@ export interface LogEntry {
   link?: { channelId: string; messageId: string; rootId: string };
 }
 
+export interface PendingTodo {
+  op: Exclude<TodoOp, "list">;
+  label: string;
+  offset: number | null;
+  assignee: Member | null;
+}
+
 export interface Pending {
+  todo: PendingTodo | null;
   channel: Channel;
   replyTo: string | null;
   label: string | null;
@@ -94,6 +107,9 @@ export interface VoiceState {
   installing: string;
   settings: Settings;
   routing: string;
+  handsFree: boolean;
+  hearing: boolean;
+  awake: boolean;
 }
 
 const HISTORY_TURNS = 12;
@@ -104,6 +120,11 @@ const POLL_MS = 15_000;
 const MAX_LOG = 200;
 const WATCH_KEY = "buzz-voice-plugin.watches";
 const TRACK_KEY = "buzz-voice-plugin.threads";
+const FOLLOW_UP_MS = 12_000;
+const YES = /\b(yes|yep|yeah|send it|do it|go ahead|confirm|sure)\b/i;
+const NO = /\b(no|nope|cancel|stop|never ?mind|don'?t)\b/i;
+const NOISE = /^\W*(?:thank you|thanks|you|bye|okay|ok|uh|um|hmm|mm|oh|so|yeah)\W*$/i;
+const OP_STATUS: Record<"start" | "done" | "reopen", Status> = { start: "doing", done: "done", reopen: "todo" };
 
 const STATE_EMOJI: Record<Exclude<ThreadState, "unknown">, string> = {
   working: "\u{1F504}",
@@ -172,9 +193,25 @@ export class Controller {
   private polling = false;
   private levelFrame = 0;
   private stopWhenOpen = false;
+  private listener: Listener;
+  private awakeUntil = 0;
+  private wantHandsFree = false;
 
   constructor(private readonly deps: ControllerDeps) {
     this.speaker = new Speaker(deps.host, () => this.state.settings);
+    this.listener = new Listener(deps.host);
+    this.listener.onHeard = (heard) => this.heard(heard);
+    this.listener.onExit = () => {
+      if (this.wantHandsFree) void this.dropHandsFree("Speech recognition stopped. Turn hands-free on to restart it.");
+    };
+    this.recorder.onLost = () => {
+      if (this.wantHandsFree) void this.dropHandsFree("The microphone disconnected.");
+    };
+    this.speaker.onIdle = () => {
+      if (!this.state.handsFree) return;
+      this.listener.reset();
+      this.wake(FOLLOW_UP_MS);
+    };
     const watches = loadJson<Watch[]>(WATCH_KEY, []).filter((w) => w.until > now());
     this.state = {
       ready: false,
@@ -195,6 +232,9 @@ export class Controller {
       installing: "",
       settings: loadSettings(),
       routing: "",
+      handsFree: false,
+      hearing: false,
+      awake: false,
     };
   }
 
@@ -212,11 +252,14 @@ export class Controller {
 
   start(): () => void {
     this.timer = setInterval(() => void this.tick(), POLL_MS);
-    void this.refreshEngine();
+    void this.refreshEngine().then(() => {
+      if (this.state.settings.handsFree) void this.setHandsFree(true);
+    });
     return () => {
       if (this.timer) clearInterval(this.timer);
       this.timer = null;
       this.recorder.release();
+      this.listener.stop();
       this.speaker.stop();
     };
   }
@@ -229,9 +272,125 @@ export class Controller {
 
   updateSettings(patch: Partial<Settings>): void {
     const settings = { ...this.state.settings, ...patch };
-    if (patch.microphone !== undefined && patch.microphone !== this.state.settings.microphone) this.recorder.release();
+    const restart =
+      (patch.modelDir !== undefined && patch.modelDir !== this.state.settings.modelDir) ||
+      (patch.whisper !== undefined && patch.whisper !== this.state.settings.whisper);
+    const micChanged = patch.microphone !== undefined && patch.microphone !== this.state.settings.microphone;
     saveSettings(settings);
     this.set({ settings });
+    if (restart) this.listener.stop();
+    if (micChanged) this.recorder.release();
+    if ((restart || micChanged) && this.wantHandsFree) void this.setHandsFree(true);
+  }
+
+  private async dropHandsFree(reason: string): Promise<void> {
+    await this.setHandsFree(false, false);
+    this.setStatus(reason, true);
+  }
+
+  private async warmListener(): Promise<boolean> {
+    if (!this.state.engine?.runtime || !this.state.ready) return false;
+    try {
+      return await this.listener.ensure(this.state.settings);
+    } catch {
+      return false;
+    }
+  }
+
+  async setHandsFree(on: boolean, remember = true): Promise<void> {
+    this.wantHandsFree = on;
+    if (!on) {
+      await this.recorder.listen(null);
+      this.listener.reset();
+      this.set({ handsFree: false, hearing: false, awake: false, opening: false });
+      if (remember && this.state.settings.handsFree) this.updateSettings({ handsFree: false });
+      return;
+    }
+    if (!this.state.ready || !this.state.engine?.runtime) {
+      this.wantHandsFree = false;
+      this.setStatus(
+        this.state.ready ? "Hands-free needs the fast speech runtime. Install it in Settings." : "Install the speech engine in Settings first.",
+        true,
+      );
+      return;
+    }
+    this.set({ opening: true, status: "Starting hands-free...", statusBad: false });
+    try {
+      const started = await this.warmListener();
+      if (!this.wantHandsFree) return;
+      if (!started) throw new Error("The speech runtime did not start.");
+      await this.recorder.listen((pcm) => {
+        if (this.speaker.speaking || this.state.listening) return;
+        this.listener.feed(pcmBase64(pcm));
+      }, this.state.settings.microphone);
+      if (!this.wantHandsFree) {
+        await this.recorder.listen(null);
+        return;
+      }
+      this.listener.reset();
+      this.set({ handsFree: true, opening: false, status: `Hands-free. Say “hey ${this.wakeWord()}”.`, statusBad: false });
+      if (!this.state.settings.handsFree) this.updateSettings({ handsFree: true });
+    } catch (error) {
+      if (!this.wantHandsFree) return;
+      this.wantHandsFree = false;
+      await this.recorder.listen(null);
+      this.set({ handsFree: false, opening: false });
+      this.setStatus(`Hands-free: ${message(error)}`, true);
+    }
+  }
+
+  toggleHandsFree(): void {
+    void this.setHandsFree(!this.wantHandsFree);
+  }
+
+  private wakeWord(): string {
+    return this.state.settings.wakeWord.trim() || "buzz";
+  }
+
+  private wake(ms: number): void {
+    this.awakeUntil = Date.now() + ms;
+    this.set({ awake: true });
+    setTimeout(() => {
+      if (Date.now() >= this.awakeUntil && this.state.awake) this.set({ awake: false });
+    }, ms + 50);
+  }
+
+  /** The command after the wake word, "" when only the wake word was said, null when it was not said. */
+  private afterWake(text: string): string | null {
+    const word = this.wakeWord().toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sounds = word === "buzz" ? "buzz|bus|buz|buzzed|bugs" : word;
+    const match = new RegExp(`^\\W*(?:(?:hey|hi|ok|okay|a)[\\s,]+)?(?:${sounds})\\b[\\s,.!?:;-]*`, "i").exec(text);
+    return match ? text.slice(match[0].length).trim() : null;
+  }
+
+  private heard(heard: Heard): void {
+    if (!this.state.handsFree) return;
+    if (heard.kind === "speech") {
+      this.set({ hearing: heard.active });
+      return;
+    }
+    if (heard.kind === "error") {
+      this.setStatus(`Speech: ${heard.message}`, true);
+      return;
+    }
+    const text = heard.text;
+    if (!text || /^\[?(blank_audio|silence|music|noise)\]?$/i.test(text) || /^[\W_]*$/.test(text)) return;
+    const command = this.afterWake(text);
+    if (command === null) {
+      if (Date.now() >= this.awakeUntil || NOISE.test(text)) return;
+      if (this.awaitingYesNo && this.state.pending) {
+        if (!NO.test(text) && !YES.test(text)) return;
+      } else if (text.split(/\s+/).length < 3) return;
+    }
+    if (command === "") {
+      this.speaker.stop();
+      this.wake(FOLLOW_UP_MS);
+      this.setStatus("Listening...");
+      return;
+    }
+    this.awakeUntil = 0;
+    this.set({ awake: false });
+    void this.handleTranscript(command ?? text);
   }
 
   async refreshEngine(): Promise<void> {
@@ -350,7 +509,9 @@ export class Controller {
         this.setStatus("I did not hear anything.");
         return;
       }
-      const text = await transcribe(this.deps.host, this.state.settings, audio.base64);
+      const text = (await this.warmListener())
+        ? await this.listener.decode(audio.pcm)
+        : await transcribe(this.deps.host, this.state.settings, audio.base64);
       if (!text || /^\[?(blank_audio|silence)\]?$/i.test(text)) {
         this.setStatus("I did not catch that.");
         return;
@@ -394,8 +555,8 @@ export class Controller {
     }
     if (this.awaitingYesNo && this.state.pending) {
       this.awaitingYesNo = false;
-      if (/\b(yes|yep|yeah|send it|do it|go ahead|confirm|sure)\b/i.test(text)) await this.publish();
-      else if (/\b(no|nope|cancel|stop|never ?mind|don'?t)\b/i.test(text)) this.cancel();
+      if (NO.test(text)) this.cancel();
+      else if (YES.test(text)) await this.publish();
       else {
         this.cancel();
         await this.route(relay, text);
@@ -434,6 +595,15 @@ export class Controller {
       const byRef = referenced ? (channels.find((c) => c.id === referenced.channelId) ?? null) : null;
       const staying = intent.continues_previous || intent.thread === "existing";
       const channel = named ?? byRef ?? (staying ? this.scope.channel : null);
+
+      if (intent.action === "todo") {
+        const home = channel ?? matchChannel(channels, null, text);
+        if (!home) {
+          this.reply(intent.channel ? `There is no channel called ${intent.channel}.` : "Which channel's todo list?", { bad: true });
+          return;
+        }
+        return await this.planTodo(relay, home, intent, text, live);
+      }
 
       if (intent.action === "status") {
         if (channel) {
@@ -474,6 +644,7 @@ export class Controller {
 
       this.set({
         pending: {
+          todo: null,
           channel,
           replyTo: target?.rootId ?? null,
           label: target?.label ?? null,
@@ -491,6 +662,135 @@ export class Controller {
     } finally {
       if (live()) this.set({ busy: false });
     }
+  }
+
+  private async planTodo(relay: Relay, channel: Channel, intent: Intent, text: string, live: () => boolean): Promise<void> {
+    this.setStatus(`Reading the todos in ${channel.name}...`);
+    const head = await relay.readCanvas(channel.id);
+    if (!live()) return;
+    const items = readTodos(head?.content ?? "").items;
+    if (intent.todo_op === "list") return this.readTodoList(channel, items);
+
+    const phrase = intent.instruction.trim().replace(/[.!?]+$/, "");
+    if (!phrase) {
+      this.reply(`I heard the ${channel.name} todos but not which one.`, { bad: true });
+      return;
+    }
+    let existing: Todo | null = null;
+    if (intent.todo_op !== "add") {
+      const status = intent.todo_op === "assign" ? null : OP_STATUS[intent.todo_op];
+      existing = findTodo(items, phrase, status ? (item) => item.status !== status : undefined);
+      if (!existing) {
+        this.reply(`No todo in ${channel.name} matches “${phrase}”.`, { bad: true });
+        return;
+      }
+    }
+    const scoped = intent.new_thread ? null : resolveThread(this.scope, channel, intent.thread_ref);
+    const target = scoped ?? (intent.thread_hint ? await this.findThread(relay, channel, intent, text) : null);
+    if (!live()) return;
+    const members = await this.rankedMembers(relay, channel, target?.rootId ?? null);
+    if (!live()) return;
+    const assignee = intent.recipient ? bestPerson(members, (m) => m.name, intent.recipient, text) : null;
+    if (intent.recipient && !assignee) {
+      this.reply(`Nobody called ${intent.recipient} is in ${channel.name}.`, { bad: true });
+      return;
+    }
+    if (intent.todo_op === "assign" && !assignee) {
+      this.reply("Who should I assign it to?", { bad: true });
+      return;
+    }
+    const label = existing?.label ?? phrase.charAt(0).toUpperCase() + phrase.slice(1);
+    const op = intent.todo_op;
+    const body = assignee && (op === "add" || op === "assign") ? `@${assignee.name} ${label}` : "";
+    this.set({
+      pending: {
+        todo: { op, label, offset: existing?.offset ?? null, assignee },
+        channel,
+        replyTo: target?.rootId ?? null,
+        label: target?.label ?? null,
+        orphaned: false,
+        body,
+        addressed: assignee?.name ?? null,
+        members,
+      },
+    });
+    const verb = { add: "Add", assign: "Assign", start: "Start", done: "Finish", reopen: "Reopen" }[op];
+    const who = assignee && (op === "add" || op === "assign") ? ` for ${assignee.name}` : "";
+    this.setStatus("Edit it if you need to, then confirm. Or say yes.");
+    this.speaker.speak(`${verb} ${plain(label)}${who} in ${channel.name}?`);
+    this.awaitingYesNo = true;
+  }
+
+  private readTodoList(channel: Channel, items: Todo[]): void {
+    const open = items.filter((item) => item.status !== "done");
+    if (items.length === 0) return this.reply(`${channel.name} has no todos.`);
+    if (open.length === 0) return this.reply(`Everything on the ${channel.name} list is done.`);
+    const lines = open.slice(0, 6).map((item) => {
+      const who = item.assignee?.name ?? item.namedAssignee?.name;
+      return `${plain(item.label)}${who ? `, ${who}` : ""}${item.status === "doing" ? ", in progress" : ""}.`;
+    });
+    const more = open.length > 6 ? ` And ${open.length - 6} more.` : "";
+    this.reply(`${open.length} open in ${channel.name}. ${lines.join(" ")}${more}`);
+  }
+
+  editTodoLabel(label: string): void {
+    const pending = this.state.pending;
+    if (!pending?.todo || pending.todo.op !== "add") return;
+    const body = pending.todo.assignee ? `@${pending.todo.assignee.name} ${label}` : "";
+    this.set({ pending: { ...pending, todo: { ...pending.todo, label }, body: pending.body ? body : "" } });
+  }
+
+  assignPending(member: Member | null): void {
+    const pending = this.state.pending;
+    if (!pending?.todo) return;
+    const body = member ? `@${member.name} ${pending.todo.label}` : "";
+    this.set({ pending: { ...pending, todo: { ...pending.todo, assignee: member }, body, addressed: member?.name ?? null } });
+  }
+
+  private async publishTodo(relay: Relay, pending: Pending): Promise<void> {
+    const todo = pending.todo!;
+    const { channel, replyTo } = pending;
+    const label = todo.op === "add" ? todo.label.replace(/\s+/g, " ").trim() : todo.label;
+    if (!label) return;
+    this.setStatus(`Updating the ${channel.name} todos...`);
+    await relay.editCanvas(channel.id, (content) => {
+      if (todo.op === "add") {
+        const next = addTodo(content, label);
+        if (!todo.assignee) return next;
+        const added = readTodos(next).items.find((item) => item.label === label && !item.assignee && !item.namedAssignee);
+        if (!added) throw new Error("Could not find the new todo to assign it.");
+        return assignTodo(next, added.offset, todo.assignee);
+      }
+      const items = readTodos(content).items;
+      const same = items.filter((i) => i.label === label);
+      const item = same.find((i) => i.offset === todo.offset) ?? (same.length === 1 ? same[0] : undefined);
+      if (!item) throw new Error(`“${label}” is no longer on the ${channel.name} list.`);
+      if (todo.op === "assign") return assignTodo(content, item.offset, todo.assignee ?? undefined);
+      return setStatus(content, item.offset, OP_STATUS[todo.op]);
+    });
+    const done = { add: "Added", assign: "Assigned", start: "Started", done: "Done", reopen: "Reopened" }[todo.op];
+    const body = pending.body.trim();
+    const mentioned = mentionsIn(body, pending.members);
+    if (!body || mentioned.length === 0) {
+      this.say("app", label, { meta: `${done} in ${channel.name} todos` });
+      this.setStatus("");
+      this.speaker.speak(`${done}.`);
+      return;
+    }
+    const event = relay.postMessage({
+      channelId: channel.id,
+      content: body,
+      mentions: mentioned.map((m) => m.pubkey),
+      replyTo: replyTo ?? undefined,
+    });
+    const rootId = replyTo ?? event.id;
+    this.watch({ rootId, channelId: channel.id, channelName: channel.name, label: body, since: event.created_at });
+    this.say("app", body, {
+      meta: `${done} in ${channel.name} todos, told ${mentioned.map((m) => m.name).join(", ")}`,
+      link: { channelId: channel.id, messageId: event.id, rootId },
+    });
+    this.setStatus(`${done}. Watching for a reply.`);
+    this.speaker.speak(`${done}, and told ${mentioned[0].name}.`);
   }
 
   private async rankedMembers(relay: Relay, channel: Channel, rootId: string | null): Promise<Member[]> {
@@ -672,6 +972,16 @@ export class Controller {
     const relay = this.deps.relay();
     const pending = this.state.pending;
     if (!relay || !pending) return;
+    if (pending.todo) {
+      this.awaitingYesNo = false;
+      this.set({ pending: null });
+      try {
+        await this.publishTodo(relay, pending);
+      } catch (error) {
+        this.reply(`That did not save: ${message(error)}`, { bad: true });
+      }
+      return;
+    }
     const body = pending.body.trim();
     if (!body) return;
     this.awaitingYesNo = false;

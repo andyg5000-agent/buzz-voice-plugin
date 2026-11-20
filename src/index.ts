@@ -59,6 +59,13 @@ export function apply(ctx: any): void {
     },
   });
   ctx.shortcuts.register({
+    id: "hands-free",
+    title: "Buzz Voice: hands-free on or off",
+    binding: { key: "h", mod: true, shift: true },
+    allowInEditable: true,
+    run: () => controller.toggleHandsFree(),
+  });
+  ctx.shortcuts.register({
     id: "stop-speaking",
     title: "Buzz Voice: stop speaking",
     binding: { key: ".", mod: true, shift: true },

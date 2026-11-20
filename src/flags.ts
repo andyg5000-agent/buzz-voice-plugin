@@ -123,3 +123,25 @@ export function groupFlags(source: FlagSource, channelNames: Map<string, string>
   }
   return [...byRoot.values()].sort((a, b) => b.at - a.at);
 }
+
+export const DEFAULT_FLAGS = ["🚩", "👀", "✅", "❗"];
+
+export function myFlags(source: FlagSource, rootId: string): Event[] {
+  return source.reactions.filter((event) => {
+    if (event.pubkey !== source.mine) return false;
+    const target = source.messages.get(targetOf(event) as string);
+    return !!target && rootOf(target) === rootId;
+  });
+}
+
+export function emojiOfFlag(event: Event): string {
+  return emojiOf(event);
+}
+
+export function withReaction(source: FlagSource, reaction: Event): FlagSource {
+  return { ...source, reactions: [reaction, ...source.reactions] };
+}
+
+export function withoutReactions(source: FlagSource, ids: Set<string>): FlagSource {
+  return { ...source, reactions: source.reactions.filter((event) => !ids.has(event.id)) };
+}

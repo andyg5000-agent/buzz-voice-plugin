@@ -2,8 +2,11 @@ import { canon } from "./match";
 import type { Scope } from "./scope";
 import type { Channel, Decide, DecisionAnswer, LlmPost, ThreadState, Turn } from "./types";
 
+export type TodoOp = "add" | "start" | "done" | "reopen" | "assign" | "list";
+
 export interface Intent {
-  action: "post" | "status" | "inbox" | "unknown";
+  action: "post" | "status" | "inbox" | "todo" | "unknown";
+  todo_op: TodoOp;
   channel: string | null;
   recipient: string | null;
   continues_previous: boolean;
@@ -22,9 +25,15 @@ const ROUTE_SCHEMA = {
   properties: {
     action: {
       type: "string",
-      enum: ["post", "status", "inbox", "unknown"],
+      enum: ["post", "status", "inbox", "todo", "unknown"],
       description:
-        "post when the speaker is assigning work or sending a message, status when they are asking about work in a channel, inbox when they ask about their inbox, unreads, notifications or what is waiting on them.",
+        "post when the speaker is assigning work or sending a message, status when they are asking about work in a channel, inbox when they ask about their inbox, unreads, notifications or what is waiting on them, todo when they add, assign, start, finish, reopen or list items on a channel's todo list.",
+    },
+    todo_op: {
+      type: "string",
+      enum: ["add", "start", "done", "reopen", "assign", "list"],
+      description:
+        "For action todo: add a new todo, start one (in progress), mark one done, reopen one, assign an existing one to someone, or list them. Use add for anything else.",
     },
     channel: {
       type: ["string", "null"],
@@ -64,7 +73,7 @@ const ROUTE_SCHEMA = {
     instruction: {
       type: "string",
       description:
-        'The message to post, as a direct instruction addressed to nobody. Keep the speaker\'s own wording and their domain terms verbatim. Strip the routing framing: the thread or channel the speaker picked out, and any "tell NAME", "tell NAME to" or "ask NAME to" wrapper. The recipient is tagged separately, so naming them here says it twice. From "in the thread about the login bug in ops tell build-bot that the fix is live" the instruction is "The fix is live." Empty for status actions.',
+        'The message to post, as a direct instruction addressed to nobody. Keep the speaker\'s own wording and their domain terms verbatim. Strip the routing framing: the thread or channel the speaker picked out, and any "tell NAME", "tell NAME to" or "ask NAME to" wrapper. The recipient is tagged separately, so naming them here says it twice. From "in the thread about the login bug in ops tell build-bot that the fix is live" the instruction is "The fix is live." Empty for status actions. For todo actions it is the todo itself, short and imperative, without the assignee: from "add a todo in ops for build-bot to rerun the deploy" it is "Rerun the deploy". For a todo that already exists it is how the speaker described it.',
     },
     filter: {
       type: "string",
@@ -79,6 +88,7 @@ const ROUTE_SCHEMA = {
   },
   required: [
     "action",
+    "todo_op",
     "channel",
     "recipient",
     "continues_previous",
@@ -236,6 +246,7 @@ async function wordsOnly(llm: LlmConfig, transcript: string, turns: Turn[]): Pro
   );
 }
 
+const TODO_OPS: TodoOp[] = ["add", "start", "done", "reopen", "assign", "list"];
 const NO_CHANNEL = "no_channel";
 const NOBODY = "nobody";
 const NO_THREAD = "none";
@@ -257,7 +268,8 @@ function short(text: string | undefined, fallback: string): string {
 }
 
 interface Routed {
-  action: "post" | "status" | "inbox";
+  action: "post" | "status" | "inbox" | "todo";
+  todo_op: TodoOp;
   channel: string | null;
   recipient: string | null;
   thread_ref: number | null;
@@ -289,6 +301,19 @@ async function decideRoute(
         post: "The speaker is issuing an instruction or sending a message to someone else.",
         status: "The speaker is asking for an update about a named project, channel or thread.",
         inbox: "The speaker is asking about their own unread messages or notifications.",
+        todo: "The speaker is adding, assigning, starting, finishing, reopening or listing items on a channel's todo list.",
+      },
+    },
+    todo_op: {
+      type: "choice",
+      instructions: "If the speaker is working with a todo list, what are they doing to it?",
+      options: {
+        add: "Adding a new todo.",
+        start: "Marking an existing todo as in progress.",
+        done: "Marking an existing todo as done.",
+        reopen: "Reopening a todo that was done.",
+        assign: "Assigning an existing todo to someone.",
+        list: "Asking what is on the list.",
       },
     },
     channel: {
@@ -355,13 +380,15 @@ async function decideRoute(
   const answers = result.answers;
 
   const action = choiceOf(answers, "action");
+  const todoOp = choiceOf(answers, "todo_op");
   const channel = choiceOf(answers, "channel");
   const recipient = choiceOf(answers, "recipient");
   const thread = choiceOf(answers, "thread");
   const filter = choiceOf(answers, "filter");
   const ref = thread && thread !== NO_THREAD ? Number(thread) : NaN;
   return {
-    action: action === "status" || action === "inbox" ? action : "post",
+    action: action === "status" || action === "inbox" || action === "todo" ? action : "post",
+    todo_op: TODO_OPS.includes(todoOp as TodoOp) ? (todoOp as TodoOp) : "add",
     channel: channel && channel !== NO_CHANNEL ? channel : null,
     recipient: recipient && recipient !== NOBODY ? recipient : null,
     thread_ref: Number.isInteger(ref) && ref > 0 && ref <= scope.threads.length ? ref : null,
@@ -426,6 +453,7 @@ export async function parseIntent(options: {
       const recipient = clean(routed.recipient);
       return {
         action: routed.action,
+        todo_op: routed.todo_op,
         channel: routed.channel,
         recipient,
         continues_previous: routed.continues_previous,
@@ -465,6 +493,9 @@ export async function parseIntent(options: {
     "thread and which channel they picked, and leave out the recipient's name:",
     "they are tagged separately and the name would appear twice.",
     "When they are asking how work is going, action is status.",
+    'Each channel has a todo list. "add a todo", "put X on the list", "mark the X todo',
+    'done" and "what is on the todo list" are action todo. In "a todo for NAME" or',
+    '"assign it to NAME", NAME is the recipient.',
     "The inbox is what is unread and waiting on the speaker across every channel.",
     '"my inbox", "unreads", "notifications", "what is waiting on me" and',
     '"anything for me" are action inbox with channel null. Inbox is never a',
@@ -496,6 +527,7 @@ export async function parseIntent(options: {
   const recipient = named && channels.some((c) => canon(c.name) === canon(named)) ? null : named;
   return {
     action: input.action ?? "unknown",
+    todo_op: TODO_OPS.includes(input.todo_op as TodoOp) ? (input.todo_op as TodoOp) : "add",
     channel: clean(input.channel),
     recipient,
     continues_previous: input.continues_previous ?? false,

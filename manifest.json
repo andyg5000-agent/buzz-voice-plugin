@@ -2,7 +2,7 @@
   "id": "blueoi.buzz-voice",
   "name": "Buzz Voice",
   "apiVersion": 1,
-  "description": "Talk to Buzz: speak a task, confirm it, and it posts to the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
+  "description": "Talk to Buzz, hands-free or push to talk: speak a task or a todo, confirm it, and it lands in the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
   "discovery": {
     "category": "productivity",
     "tags": [
@@ -29,6 +29,24 @@
           "-c",
           "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\nn=${3:-small.en}\nv=2.0.1\nr=https://github.com/k2-fsa/sherpa-onnx/releases/download\ne=false; if [ -x \"$d/sherpa-onnx/bin/sherpa-onnx-offline\" ] || command -v sherpa-onnx-offline >/dev/null; then e=true; fi\nm=false; [ -f \"$d/sherpa-onnx-whisper-$n/$n-tokens.txt\" ] && m=true\nif [ \"$2\" = install ]; then\nset -e; mkdir -p \"$d\"; cd \"$d\"\ncase $(uname -s) in Darwin) p=osx-universal2;; *) p=linux-x64;; esac\nif [ $e = false ]; then\necho \"progress engine\"\ncurl -fsSL \"$r/v$v/sherpa-onnx-v$v-$p-shared-no-tts.tar.bz2\" | tar xjf -\nrm -rf sherpa-onnx; mv \"sherpa-onnx-v$v-$p-shared-no-tts\" sherpa-onnx; e=true\nfi\nif [ $m = false ]; then\necho \"progress model\"\ncurl -fsSL \"$r/asr-models/sherpa-onnx-whisper-$n.tar.bz2\" | tar xjf -; m=true\nfi\nfi\ns=null; c=\"$HOME/Library/Application Support/com.blueoakinteractive.buzz-voice/settings.json\"\n[ -f \"$c\" ] && s=$(cat \"$c\")\nprintf '{\"engine\":%s,\"model\":%s,\"buzzVoice\":%s}\\n' $e $m \"$s\"",
           "buzz-voice-setup"
+        ]
+      },
+      {
+        "id": "runtime",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\np=$d/venv/bin/python3\nv=$d/silero_vad.onnx\nok() { [ -x \"$p\" ] && [ -f \"$v\" ] && \"$p\" -I -c 'import sherpa_onnx, numpy' 2>/dev/null; }\nif [ \"$2\" = install ] && ! ok; then\nset -e; mkdir -p \"$d\"\ncommand -v python3 >/dev/null || { echo '{\"runtime\":false,\"error\":\"no-python\"}'; exit 0; }\necho \"progress runtime\"\n[ -x \"$p\" ] || python3 -m venv \"$d/venv\"\n\"$p\" -m pip install -q --disable-pip-version-check sherpa-onnx==2.0.1 numpy >&2\n[ -f \"$v\" ] || curl -fsSL -o \"$v\" https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx\nset +e\nfi\nif ok; then echo '{\"runtime\":true}'; else echo '{\"runtime\":false}'; fi",
+          "buzz-voice-runtime"
+        ]
+      },
+      {
+        "id": "listen",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\np=$d/venv/bin/python3\n[ -x \"$p\" ] || { echo '{\"error\":\"no-runtime\"}'; exit 0; }\nexec \"$p\" -I -u -c \"$4\" \"$d\" \"${2:-small.en}\" \"${3:-0.6}\"",
+          "buzz-voice-listen"
         ]
       },
       {

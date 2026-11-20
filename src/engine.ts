@@ -1,3 +1,7 @@
+import LISTEN_PY from "../scripts/listen.py";
+
+const TARGET_RATE = 16000;
+const TAP_SAMPLES = TARGET_RATE / 10;
 export interface HostProcess {
   write(data: string): Promise<void>;
   end(data?: string): Promise<void>;
@@ -21,6 +25,8 @@ export interface Settings {
   voice: string;
   speak: boolean;
   microphone: string;
+  handsFree: boolean;
+  wakeWord: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -32,6 +38,8 @@ export const DEFAULT_SETTINGS: Settings = {
   voice: "",
   speak: true,
   microphone: "",
+  handsFree: false,
+  wakeWord: "buzz",
 };
 
 const SETTINGS_KEY = "buzz-voice-plugin.settings";
@@ -108,19 +116,32 @@ async function run(
 export interface EngineStatus {
   engine: boolean;
   model: boolean;
+  runtime: boolean;
   buzzVoice: Record<string, unknown> | null;
 }
 
-function parseStatus(stdout: string): EngineStatus {
+function parseStatus(stdout: string, runtime: boolean): EngineStatus {
   const at = stdout.indexOf('{"engine"');
   if (at < 0) throw new Error("The setup script returned nothing.");
   const parsed = JSON.parse(stdout.slice(at).trim());
-  return { engine: !!parsed.engine, model: !!parsed.model, buzzVoice: parsed.buzzVoice ?? null };
+  return { engine: !!parsed.engine, model: !!parsed.model, runtime, buzzVoice: parsed.buzzVoice ?? null };
+}
+
+async function runtimeReady(host: Host, settings: Settings, install: boolean, onLine?: (line: string) => void): Promise<boolean> {
+  try {
+    const result = await run(host, "runtime", [settings.modelDir, install ? "install" : "check"], "", onLine);
+    return /"runtime":true/.test(result.stdout);
+  } catch {
+    return false;
+  }
 }
 
 export async function checkEngine(host: Host, settings: Settings): Promise<EngineStatus> {
-  const result = await run(host, "setup", [settings.modelDir, "check", settings.whisper]);
-  return parseStatus(result.stdout);
+  const [result, runtime] = await Promise.all([
+    run(host, "setup", [settings.modelDir, "check", settings.whisper]),
+    runtimeReady(host, settings, false),
+  ]);
+  return parseStatus(result.stdout, runtime);
 }
 
 export async function installEngine(
@@ -132,7 +153,10 @@ export async function installEngine(
     if (line.startsWith("progress ")) progress(line.slice(9));
   });
   if (result.code !== 0) throw new Error(result.stderr.trim().split("\n").pop() || "Install failed.");
-  return parseStatus(result.stdout);
+  const runtime = await runtimeReady(host, settings, true, (line) => {
+    if (line.startsWith("progress ")) progress(line.slice(9));
+  });
+  return parseStatus(result.stdout, runtime);
 }
 
 export async function transcribe(host: Host, settings: Settings, wavBase64: string): Promise<string> {
@@ -162,9 +186,161 @@ export function llmPoster(host: Host, settings: Settings) {
   };
 }
 
+const DECODE_CHUNK = TARGET_RATE * 10;
+
+export function pcmBase64(samples: Float32Array): string {
+  const bytes = new Uint8Array(samples.length * 2);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < samples.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return toBase64(bytes);
+}
+
+export type Heard =
+  | { kind: "speech"; active: boolean }
+  | { kind: "text"; text: string; ms: number }
+  | { kind: "error"; message: string };
+
+export class Listener {
+  private process: HostProcess | null = null;
+  private starting: Promise<boolean> | null = null;
+  private key = "";
+  private nextId = 1;
+  private waiting = new Map<string, { resolve(text: string): void; reject(error: Error): void }>();
+  private generation = 0;
+  private abandon: () => void = () => {};
+  onHeard: (heard: Heard) => void = () => {};
+  /** The recogniser exited without being asked to. */
+  onExit: () => void = () => {};
+
+  constructor(private readonly host: Host) {}
+
+  get running(): boolean {
+    return this.process !== null;
+  }
+
+  async ensure(settings: Settings): Promise<boolean> {
+    const key = `${settings.modelDir}|${settings.whisper}`;
+    if (this.process && this.key === key) return true;
+    if (this.starting && this.key === key) return this.starting;
+    this.stop();
+    this.key = key;
+    this.starting = this.launch(settings).finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
+  }
+
+  private async launch(settings: Settings): Promise<boolean> {
+    if (!this.host.spawn) return false;
+    const generation = ++this.generation;
+    let partial = "";
+    let ready: (ok: boolean) => void = () => {};
+    const started = new Promise<boolean>((resolve) => {
+      ready = resolve;
+    });
+    this.abandon = () => ready(false);
+    const process = await this.host.spawn("listen", {
+      args: [settings.modelDir, settings.whisper, "0.6", LISTEN_PY],
+      onStdout: (data) => {
+        partial += data;
+        const lines = partial.split("\n");
+        partial = lines.pop() ?? "";
+        for (const line of lines) this.line(line, ready);
+      },
+    });
+    if (generation !== this.generation) {
+      void process.kill().catch(() => undefined);
+      return false;
+    }
+    this.process = process;
+    void process.exited.then(() => {
+      if (this.process !== process) return;
+      this.process = null;
+      ready(false);
+      this.fail();
+      this.onExit();
+    });
+    const ok = await started;
+    if (!ok && this.process === process) this.stop();
+    return ok;
+  }
+
+  private line(line: string, ready: (ok: boolean) => void): void {
+    if (!line.startsWith("{")) return;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (parsed.ready) return ready(true);
+    if (parsed.error === "no-runtime") return ready(false);
+    if (typeof parsed.id === "string") {
+      const waiter = this.waiting.get(parsed.id);
+      this.waiting.delete(parsed.id);
+      if (parsed.error) waiter?.reject(new Error(parsed.error));
+      else waiter?.resolve(String(parsed.text ?? "").trim());
+      return;
+    }
+    if (typeof parsed.speech === "boolean") this.onHeard({ kind: "speech", active: parsed.speech });
+    else if (typeof parsed.text === "string") this.onHeard({ kind: "text", text: parsed.text.trim(), ms: parsed.ms ?? 0 });
+    else if (parsed.error) this.onHeard({ kind: "error", message: String(parsed.error) });
+  }
+
+  feed(pcmBase64: string): void {
+    void this.process?.write(`a ${pcmBase64}\n`).catch(() => undefined);
+  }
+
+  reset(): void {
+    void this.process?.write("r\n").catch(() => undefined);
+  }
+
+  async decode(pcm: Float32Array): Promise<string> {
+    const process = this.process;
+    if (!process) throw new Error("Speech recognition is not running.");
+    const id = String(this.nextId++);
+    const result = new Promise<string>((resolve, reject) => this.waiting.set(id, { resolve, reject }));
+    try {
+      for (let at = 0; at < pcm.length; at += DECODE_CHUNK) {
+        await process.write(`p ${id} ${pcmBase64(pcm.subarray(at, at + DECODE_CHUNK))}\n`);
+      }
+      await process.write(`d ${id}\n`);
+    } catch (error) {
+      this.waiting.delete(id);
+      result.catch(() => undefined);
+      throw error;
+    }
+    return result;
+  }
+
+  private fail(): void {
+    for (const waiter of this.waiting.values()) waiter.reject(new Error("Speech recognition stopped."));
+    this.waiting.clear();
+  }
+
+  stop(): void {
+    const process = this.process;
+    this.process = null;
+    this.generation += 1;
+    this.abandon();
+    this.fail();
+    void process?.kill().catch(() => undefined);
+  }
+}
+
 export class Speaker {
   private current: HostProcess | null = null;
   private queue: Promise<void> = Promise.resolve();
+  private queued = 0;
+  private generation = 0;
+  onIdle: () => void = () => {};
+
+  get speaking(): boolean {
+    return this.queued > 0;
+  }
 
   constructor(
     private readonly host: Host,
@@ -176,7 +352,14 @@ export class Speaker {
     if (!settings.speak) return;
     const clean = text.replace(/^[\s-]+/, "").trim();
     if (!clean) return;
-    this.queue = this.queue.then(() => this.say(clean, settings)).catch(() => undefined);
+    this.queued += 1;
+    const generation = this.generation;
+    this.queue = this.queue
+      .then(() => (generation === this.generation ? this.say(clean, settings) : undefined))
+      .catch(() => undefined)
+      .finally(() => {
+        if (generation === this.generation) this.done();
+      });
   }
 
   private async say(text: string, settings: Settings): Promise<void> {
@@ -201,15 +384,24 @@ export class Speaker {
     });
   }
 
+  private done(): void {
+    if (this.queued === 0) return;
+    this.queued -= 1;
+    if (this.queued === 0) this.onIdle();
+  }
+
   stop(): void {
+    const was = this.queued > 0;
+    this.queued = 0;
+    this.generation += 1;
     this.queue = Promise.resolve();
     void this.current?.kill();
     this.current = null;
     if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+    if (was) this.onIdle();
   }
 }
 
-const TARGET_RATE = 16000;
 const MAX_SECONDS = 120;
 
 const PREROLL_SECONDS = 0.6;
@@ -228,6 +420,11 @@ export class Recorder {
   private prerollSamples = 0;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onLevel: (level: number) => void = () => {};
+  private tap: ((pcm: Float32Array) => void) | null = null;
+  /** The microphone closed while hands-free was streaming from it. */
+  onLost: () => void = () => {};
+  private tapped: Float32Array[] = [];
+  private tappedSamples = 0;
   level = 0;
 
   get active(): boolean {
@@ -272,6 +469,7 @@ export class Recorder {
     const node = context.createScriptProcessor(2048, 1, 1);
     node.onaudioprocess = (event) => {
       const input = new Float32Array(event.inputBuffer.getChannelData(0));
+      if (this.tap) this.feedTap(resample(input, context.sampleRate, TARGET_RATE));
       if (this.capturing) {
         if (this.samples < context.sampleRate * MAX_SECONDS) {
           this.chunks.push(input);
@@ -295,14 +493,48 @@ export class Recorder {
     this.context = context;
     this.node = node;
     if (context.state === "suspended") await context.resume();
-    stream.getTracks().forEach((track) => track.addEventListener("ended", () => this.release()));
+    stream.getTracks().forEach((track) =>
+      track.addEventListener("ended", () => {
+        if (this.stream !== stream) return;
+        const tapped = this.tap !== null;
+        this.release();
+        if (tapped) this.onLost();
+      }),
+    );
     this.armIdle();
+  }
+
+  /** Streams 16 kHz audio in 100 ms frames while set, and keeps the microphone open. */
+  async listen(tap: ((pcm: Float32Array) => void) | null, deviceId = ""): Promise<void> {
+    this.tap = tap;
+    this.tapped = [];
+    this.tappedSamples = 0;
+    if (tap) await this.warm(deviceId);
+    else this.armIdle();
+  }
+
+  private feedTap(pcm: Float32Array): void {
+    this.tapped.push(pcm);
+    this.tappedSamples += pcm.length;
+    if (this.tappedSamples < TAP_SAMPLES) return;
+    const frame = new Float32Array(this.tappedSamples);
+    let at = 0;
+    for (const chunk of this.tapped) {
+      frame.set(chunk, at);
+      at += chunk.length;
+    }
+    this.tapped = [];
+    this.tappedSamples = 0;
+    let peak = 0;
+    for (let i = 0; i < frame.length; i += 16) peak = Math.max(peak, Math.abs(frame[i]));
+    this.level = peak;
+    this.tap?.(frame);
   }
 
   private armIdle(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      if (!this.capturing) this.release();
+      if (!this.capturing && !this.tap) this.release();
     }, IDLE_RELEASE_MS);
   }
 
@@ -319,7 +551,7 @@ export class Recorder {
     this.capturing = true;
   }
 
-  async stop(): Promise<{ base64: string; seconds: number; peak: number } | null> {
+  async stop(): Promise<{ base64: string; pcm: Float32Array; seconds: number; peak: number } | null> {
     const context = this.context;
     if (!context || !this.capturing) return null;
     this.capturing = false;
@@ -339,7 +571,7 @@ export class Recorder {
     const pcm = resample(merged, rate, TARGET_RATE);
     let peak = 0;
     for (let i = 0; i < pcm.length; i += 1) peak = Math.max(peak, Math.abs(pcm[i]));
-    return { base64: toBase64(wav(pcm, TARGET_RATE)), seconds: pcm.length / TARGET_RATE, peak };
+    return { base64: toBase64(wav(pcm, TARGET_RATE)), pcm, seconds: pcm.length / TARGET_RATE, peak };
   }
 
   cancel(): void {
@@ -352,6 +584,7 @@ export class Recorder {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
     this.capturing = false;
+    this.tap = null;
     this.node?.disconnect();
     this.stream?.getTracks().forEach((track) => track.stop());
     void this.context?.close().catch(() => undefined);
