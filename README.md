@@ -1,75 +1,44 @@
 # Buzz Voice plugin
 
-Talk to Buzz from inside the Buzz desktop app, the way the standalone Buzz Voice
-app works.
+A live, reactive voice collaborator inside the Buzz desktop app — powered by your own language models and speech systems.
 
-- **Talk.** Hold the button (or tap to latch, or press Cmd+Shift+Space anywhere
-  in Buzz) and say what you want: "in ops tell build-bot to rerun the deploy",
-  "how is the deploy going in ops", "what is in my inbox". A task comes back as
-  an editable card with the channel, thread and who it notifies; say "yes" or
-  press Enter to send. Questions are read back out loud. Threads you post to or
-  ask about are watched for eight hours and new replies are read out as they
-  land. You can also type instead of talking.
-- **Hands-free.** Turn it on (or press Cmd+Shift+H) and say "hey Buzz, ..."
-  followed by the command. The end of a sentence is found by voice activity
-  detection, so there is nothing to press. After Buzz speaks you have a few
-  seconds to answer without the wake word, which is how "yes" confirms a card.
-  The microphone is ignored while Buzz is speaking.
-- **Todos.** "In ops add a todo for build-bot to rerun the deploy", "mark the
-  deploy todo done", "assign the API keys todo to Bob", "what is on the todo
-  list in ops". Todos live in the channel Canvas under `## Todos`, the same
-  list the Todos panel edits. Assigning someone also mentions them in the
-  thread, because an assignment alone does not wake an agent.
-- **Flags.** Every thread that carries a reaction, grouped by emoji with counts,
-  for everyone or just yours. Pick a thread to read the whole conversation in
-  a preview beside the list (arrow keys move through threads). Click a message
-  or Open to jump to it in Buzz, follow the thread, or use the
-  flag button to add or remove your own reactions. The tab, filters and scroll
-  position are kept when you leave the page and come back.
+- **Live conversation (`⌘⇧L`).** Natural back-and-forth voice with no wake word, low-latency Silero VAD endpointing, real **barge-in** (talk anytime to interrupt playback and abort the in-flight response), SSE streaming LLM replies, and pipelined sentence-by-sentence WebAudio TTS.
+- **Conversational Buzz tools.** Ask about channels, threads, unread mentions, and Canvas todos; draft, refine, and send messages or delegate to agents naturally ("make it shorter and tag opus too", "send it"); flag threads with emoji. Toggle *Confirm before sending* on or off in Settings.
+- **Live thread reactivity.** Watched threads subscribe via `session.observe` so agent replies land in under a second, summarize long replies into 1–2 spoken sentences, and automatically put that thread in conversational focus.
+- **Talk & Wake-word hands-free.** Push-to-talk (`⌘⇧Space`), wake-word hands-free (`⌘⇧H`, "hey Buzz, ..."), instant stop/interrupt (`⌘⇧.`), and typed commands all remain available. Auto-pauses if you join a native Buzz Huddle.
+- **Flags.** Every thread that carries a reaction, grouped by emoji with counts, for everyone or just yours, with a full thread preview beside the list.
 
-## What runs where
+## Pluggable models & speech systems
 
-- Speech to text runs on your machine with sherpa-onnx and the whisper
-  `small.en` model, the same engine and model folder (`~/buzz-voice-models`) the
-  standalone app uses. Audio never leaves the machine. If the engine or model is
-  missing, the page offers an install button that downloads them from the
-  sherpa-onnx GitHub releases.
-- Fast speech and hands-free use the sherpa-onnx Python package in a venv in
-  the same folder (`venv/`, plus `silero_vad.onnx`). One process keeps whisper
-  loaded and runs voice activity detection on the microphone stream, so
-  nothing is reloaded per sentence. Install it from Settings; it needs
-  `python3`. Without it, push to talk falls back to the one-shot engine.
-- Routing (which channel, thread and person) uses the Decisions API provider
-  chosen in Buzz Settings when one is on, and falls back to the language model.
-- The language model writes the message body and reads channels back. Any
-  OpenAI-compatible endpoint works, http or https, set under Settings > Buzz
-  Voice. If the standalone app is installed its endpoint is picked up
-  automatically.
-- Posting and reading go through your signed-in Buzz session. No keys are
-  stored by the plugin.
-- Replies are spoken with the macOS `say` voice.
+Configure everything under **Settings > Buzz Voice**:
+
+- **Language model:** Any OpenAI-compatible `/v1/chat/completions` endpoint (Ollama, vLLM, LiteLLM, LM Studio, OpenAI, etc.) with streaming SSE + tool calling. Falls back to the Buzz Decisions API when no LLM URL is set.
+- **Speech to text (STT):**
+  - **Local (`sherpa-onnx` Whisper)** in `~/buzz-voice-models` (offline, default).
+  - **OpenAI-compatible `/v1/audio/transcriptions`** (LAN `whisper.cpp`, Speaches / `faster-whisper`, MLX-Whisper, Groq, OpenAI) while keeping local Silero VAD for fast endpointing and barge-in.
+- **Text to speech (TTS)** — all rendered through a WebAudio playout queue for echo cancellation and <5 ms interrupt:
+  - **System voice** (macOS `say` rendered to 24 kHz WAV -> WebAudio, with fallback to direct `say` / Web Speech).
+  - **Local neural TTS (`sherpa-onnx`)** — 1-click install for Kokoro English (`kokoro-en-v0_19`) or Piper Lessac (`vits-piper-en_US-lessac-medium`), kept warm in memory.
+  - **OpenAI-compatible `/v1/audio/speech`** (Kokoro-FastAPI, Speaches, Piper HTTP, Orpheus, OpenAI, etc.).
 
 ## Host access it asks for
 
 | Process | Why |
 | --- | --- |
-| `sh` (stt) | Decode the recorded audio with the local sherpa-onnx engine |
-| `sh` (setup) | Check for, or download, the engine and model |
-| `sh` (runtime) | Check for, or install, the Python speech runtime and VAD model |
-| `sh` (listen) | Run the long-lived recogniser in `scripts/listen.py` |
-| `say` | Speak replies |
-| `curl` (llm) | Call your language model, including plain http on a LAN |
+| `sh` (`stt`, `stt-http`) | Transcribe recorded audio locally (`sherpa-onnx`) or via your OpenAI-compatible STT endpoint |
+| `sh` (`setup`, `runtime`, `tts-setup`) | Check for or install `sherpa-onnx`, Whisper, Silero VAD, and local neural TTS models |
+| `sh` (`listen`) | Run the long-lived VAD + STT worker (`scripts/listen.py`) |
+| `sh` (`tts-local`, `tts-http`, `tts-say`) + `say` | Synthesize speech locally, via your OpenAI-compatible TTS endpoint, or via macOS `say` into WebAudio |
+| `curl` (`llm`) | Stream responses from your language model, including plain `http` on a LAN |
 
-The shell scripts are in `scripts/` and embedded verbatim in `manifest.json`.
-`scripts/listen.py` is bundled into `plugin.js` and passed to the listen
-process as its program text.
+The shell scripts live in `scripts/` (each under the 1024-byte host arg limit) and are embedded verbatim in `manifest.json`. `scripts/listen.py` and `scripts/tts.py` are bundled into `plugin.js`.
 
 ## Install
 
 Settings > Plugins > Manage plugins > Add, then import from Git:
 `https://github.com/andyg5000-agent/buzz-voice-plugin.git`, branch `main`.
 
-## Build
+## Build & Verify
 
 `plugin.js` and `manifest.json` are generated. Edit `src/` or `scripts/`, then:
 
@@ -77,4 +46,5 @@ Settings > Plugins > Manage plugins > Add, then import from Git:
 npm install
 npm run check
 npm run build
+npm test
 ```

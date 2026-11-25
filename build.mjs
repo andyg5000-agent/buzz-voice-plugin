@@ -12,16 +12,21 @@ const manifest = {
   name: "Buzz Voice",
   apiVersion: 1,
   description:
-    "Talk to Buzz, hands-free or push to talk: speak a task or a todo, confirm it, and it lands in the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
+    "Live, reactive voice assistant for Buzz with barge-in, streaming replies, and pluggable LLM, STT, and TTS backends. Talk hands-free or push to talk, manage todos, and find threads by emoji.",
   discovery: { category: "productivity", tags: ["voice", "speech", "emoji"] },
   updates: { defaultEnabled: true },
   host: {
     processes: [
       { id: "stt", program: "sh", args: ["-c", script("stt"), "buzz-voice-stt"] },
+      { id: "stt-http", program: "sh", args: ["-c", script("stt-http"), "buzz-voice-stt-http"] },
       { id: "setup", program: "sh", args: ["-c", script("setup"), "buzz-voice-setup"] },
       { id: "runtime", program: "sh", args: ["-c", script("runtime"), "buzz-voice-runtime"] },
       { id: "listen", program: "sh", args: ["-c", script("listen"), "buzz-voice-listen"] },
       { id: "say", program: "say" },
+      { id: "tts-say", program: "sh", args: ["-c", script("tts-say"), "buzz-voice-tts-say"] },
+      { id: "tts-http", program: "sh", args: ["-c", script("tts-http"), "buzz-voice-tts-http"] },
+      { id: "tts-local", program: "sh", args: ["-c", script("tts-local"), "buzz-voice-tts-local"] },
+      { id: "tts-setup", program: "sh", args: ["-c", script("tts-setup"), "buzz-voice-tts-setup"] },
       {
         id: "llm",
         program: "curl",

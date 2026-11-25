@@ -82,6 +82,17 @@ const CSS = `
 .bv-dot{width:.5rem;height:.5rem;border-radius:50%;background:var(--text-disabled);flex:none}
 .bv-dot[data-state=online]{background:var(--text-success)}
 .bv-dot[data-state=error]{background:var(--text-danger)}
+.bv-dot[data-state=live]{background:var(--affordance-accent-prominent);animation:bv-pulse 1.2s ease-in-out infinite}
+@keyframes bv-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
+.bv-pill{display:inline-flex;align-items:center;gap:var(--space-2);padding:var(--space-1) var(--space-3);border:1px solid var(--border-standard);border-radius:var(--radius-pill);background:var(--surface-inset)}
+.bv-pill[data-active]{border-color:var(--affordance-accent-prominent)}
+.bv-controls{display:flex;gap:var(--space-2);align-items:stretch}
+.bv-controls>.bv-talk{flex:1;min-width:0}
+.bv-live{display:flex;align-items:center;justify-content:center;gap:var(--space-2);min-height:3.5rem;padding:0 var(--space-4);border:1px solid var(--border-standard);border-radius:var(--radius-container);background:var(--surface-inset);color:var(--text-standard);font:inherit;cursor:pointer;white-space:nowrap;transition:background var(--duration-fast),color var(--duration-fast),border-color var(--duration-fast)}
+.bv-live:hover:not(:disabled){background:var(--affordance-subtle-hover)}
+.bv-live[data-live]{background:var(--affordance-accent-prominent);border-color:transparent;color:var(--text-on-accent)}
+.bv-live:disabled{opacity:.55;cursor:default}
+.bv-turn[data-streaming] .bv-bubble{border:1px dashed var(--border-standard)}
 .bv-scope{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;padding:0 var(--space-panel-inset) var(--space-2);min-width:0}
 .bv-truncate{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bv-log{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:var(--space-3);padding:var(--space-2) var(--space-panel-inset) var(--space-4)}
@@ -393,7 +404,7 @@ export function createUi(deps: UiDeps) {
   function Turn({ entry }: { entry: LogEntry }) {
     return h(
       "div",
-      { className: "bv-turn", "data-role": entry.role, "data-bad": entry.bad || undefined },
+      { className: "bv-turn", "data-role": entry.role, "data-bad": entry.bad || undefined, "data-streaming": entry.streaming || undefined },
       (entry.meta || entry.link) &&
         h(
           "div",
@@ -587,25 +598,77 @@ export function createUi(deps: UiDeps) {
     );
   }
 
-  function HandsFree({ voice }: { voice: VoiceState }) {
+  function ActivityBar({ voice }: { voice: VoiceState }) {
     const word = voice.settings.wakeWord.trim() || "buzz";
-    const label = !voice.handsFree
-      ? "Hands-free off"
-      : voice.hearing
-        ? "Hearing you..."
-        : voice.awake
-          ? "Go ahead"
-          : `Say “hey ${word}”`;
+    const activityText =
+      voice.huddlePaused
+        ? "Paused for Huddle"
+        : voice.activity === "hearing"
+          ? "Hearing you..."
+          : voice.activity === "transcribing"
+            ? "Transcribing..."
+            : voice.activity === "thinking"
+              ? voice.activityDetail || "Thinking..."
+              : voice.activity === "speaking"
+                ? voice.settings.bargeIn && (voice.liveMode || voice.handsFree)
+                  ? "Speaking (talk to interrupt)"
+                  : "Speaking..."
+                : voice.liveMode
+                  ? "Live · Listening"
+                  : voice.handsFree
+                    ? voice.awake
+                      ? "Go ahead"
+                      : `Say “hey ${word}”`
+                    : "Hands-free off";
+    const dotState =
+      voice.activity === "hearing" || voice.activity === "speaking" || voice.activity === "thinking"
+        ? "live"
+        : voice.liveMode || (voice.handsFree && voice.awake)
+          ? "online"
+          : undefined;
+    const canStop = voice.speaking || voice.busy;
     return h(
       "div",
       { className: "bv-row", style: { justifyContent: "space-between" } },
       h(
         "span",
-        { className: "bv-row text-caption text-subtle" },
-        h("span", { className: "bv-dot", "data-state": voice.handsFree ? (voice.hearing || voice.awake ? "online" : "idle") : undefined }),
-        label,
+        { className: "bv-pill text-caption text-subtle", "data-active": voice.liveMode || voice.speaking || voice.hearing || undefined },
+        h("span", { className: "bv-dot", "data-state": dotState }),
+        activityText,
       ),
-      h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() }),
+      h(
+        "div",
+        { className: "bv-row" },
+        canStop && h(Button, { variant: "subtle", size: "sm", onClick: () => controller.stopSpeaking() }, "Stop"),
+        !voice.liveMode &&
+          voice.engine?.runtime &&
+          h(
+            "label",
+            { className: "bv-row text-caption text-subtle", style: { cursor: "pointer" } },
+            "Wake word",
+            h(Switch, { label: "Hands-free wake word", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() }),
+          ),
+      ),
+    );
+  }
+
+  function LiveButton({ voice }: { voice: VoiceState }) {
+    const disabled = !voice.engine?.runtime || !voice.ready || voice.opening;
+    return h(
+      "button",
+      {
+        type: "button",
+        className: "bv-live text-label",
+        disabled,
+        "data-live": voice.liveMode || undefined,
+        "aria-pressed": voice.liveMode,
+        title: voice.liveMode
+          ? "End Live conversation (⌘⇧L)"
+          : "Start Live conversation — no wake word, interrupt anytime (⌘⇧L)",
+        onClick: () => controller.toggleLiveMode(),
+      },
+      h("span", { className: "bv-dot", "data-state": voice.liveMode ? "live" : undefined }),
+      voice.liveMode ? "End Live" : "Live",
     );
   }
 
@@ -662,13 +725,14 @@ export function createUi(deps: UiDeps) {
   function Talk({ voice }: { voice: VoiceState }) {
     const [typed, setTyped] = useState("");
     const log = useRef(null as any);
+    const lastText = voice.log.at(-1)?.text ?? "";
     useEffect(() => {
       if (voice.ready) controller.warmMicrophone();
     }, [voice.ready, voice.settings.microphone]);
     useEffect(() => {
       const node = log.current;
       if (node) node.scrollTop = node.scrollHeight;
-    }, [voice.log.length, !!voice.pending]);
+    }, [voice.log.length, lastText.length, !!voice.pending]);
     const level = Math.min(1, voice.level * 3);
     const watching = voice.watches.length;
     return h(
@@ -683,7 +747,7 @@ export function createUi(deps: UiDeps) {
             h(
               "span",
               { title: voice.watches.map((w) => `${w.channelName}: ${w.label}`).join("\n") },
-              `${voice.scope ? "· " : ""}Watching ${watching} ${watching === 1 ? "thread" : "threads"}`,
+              `${voice.scope ? "· " : ""}Watching ${watching} ${watching === 1 ? "thread" : "threads"} (live)`,
             ),
         ),
       h(
@@ -695,7 +759,8 @@ export function createUi(deps: UiDeps) {
             ? h(EmptyState, {
                 icon: "mic",
                 title: "Talk to Buzz",
-                description: "“In ops, tell build-bot to rerun the deploy.” “Add a todo in ops for build-bot to rotate the keys.” “How is work going in ops?” “What’s in my inbox?”",
+                description:
+                  "Hit Live (⌘⇧L) for natural back-and-forth with barge-in, or hold Talk: “What’s going on in ops?” “Tell build-bot to rerun the deploy.” “What’s in my inbox?”",
               })
             : null,
         voice.log.map((entry) => h(Turn, { key: entry.id, entry })),
@@ -705,12 +770,17 @@ export function createUi(deps: UiDeps) {
         "div",
         { className: "bv-footer" },
         h("div", { className: "bv-meter", "aria-hidden": true }, h("span", { style: { width: `${Math.round(level * 100)}%` } })),
-        voice.ready && voice.engine?.runtime && h(HandsFree, { voice }),
-        h(TalkButton, { voice }),
+        (voice.ready || voice.speaking || voice.busy) && h(ActivityBar, { voice }),
+        h(
+          "div",
+          { className: "bv-controls" },
+          voice.engine?.runtime && h(LiveButton, { voice }),
+          h(TalkButton, { voice }),
+        ),
         h(
           "p",
           { className: `bv-status text-caption ${voice.statusBad ? "text-danger" : "text-subtle"}`, role: voice.statusBad ? "alert" : "status" },
-          voice.status || (voice.ready ? "Or press ⌘⇧Space anywhere in Buzz, ⌘⇧H for hands-free" : ""),
+          voice.status || (voice.ready ? "⌘⇧L Live · ⌘⇧Space Push to talk · ⌘⇧H Wake word · ⌘⇧. Stop" : ""),
         ),
         h(
           "form",
@@ -726,10 +796,9 @@ export function createUi(deps: UiDeps) {
             "aria-label": "Type a command",
             placeholder: "Or type what you would say",
             value: typed,
-            disabled: voice.busy,
             onChange: (event: any) => setTyped(event.target.value),
           }),
-          h(Button, { type: "submit", variant: "subtle", disabled: voice.busy || !typed.trim() }, "Send"),
+          h(Button, { type: "submit", variant: "subtle", disabled: !typed.trim() }, "Send"),
         ),
       ),
     );
@@ -1347,6 +1416,105 @@ export function createUi(deps: UiDeps) {
     );
   }
 
+  function SttApiForm({ settings }: { settings: Settings }) {
+    const [draft, setDraft] = useState({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey });
+    const [saved, setSaved] = useState(false);
+    useEffect(() => setDraft({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey }), [settings.sttUrl, settings.sttModel, settings.sttKey]);
+    const dirty = draft.sttUrl !== settings.sttUrl || draft.sttModel !== settings.sttModel || draft.sttKey !== settings.sttKey;
+    const invalid = draft.sttUrl.trim() !== "" && !/^https?:\/\/[^\s]+$/i.test(draft.sttUrl.trim());
+    const set = (key: keyof typeof draft) => (event: any) => {
+      setSaved(false);
+      setDraft({ ...draft, [key]: event.target.value });
+    };
+    return h(
+      "form",
+      {
+        className: "bv-form",
+        noValidate: true,
+        onSubmit: (event: any) => {
+          event.preventDefault();
+          if (invalid) return;
+          controller.updateSettings({ sttUrl: draft.sttUrl.trim(), sttModel: draft.sttModel.trim() || "whisper-1", sttKey: draft.sttKey.trim() });
+          setSaved(true);
+        },
+      },
+      h(
+        Field,
+        { label: "STT Endpoint", description: "OpenAI-compatible /v1/audio/transcriptions base URL (whisper.cpp, Speaches, faster-whisper, Groq, OpenAI)." },
+        h(Input, { value: draft.sttUrl, onChange: set("sttUrl"), placeholder: "http://localhost:8000/v1", spellCheck: false, autoCapitalize: "off", autoCorrect: "off" }),
+      ),
+      invalid && h("p", { className: "buzz-field-error text-caption text-danger", role: "alert", style: { margin: 0 } }, "Enter a URL starting with http:// or https://."),
+      h(Field, { label: "STT Model" }, h(Input, { value: draft.sttModel, onChange: set("sttModel"), placeholder: "whisper-1", spellCheck: false })),
+      h(Field, { label: "API key", description: "Optional. Stored on this device only." }, h(Input, { type: "password", value: draft.sttKey, onChange: set("sttKey"), autoComplete: "off" })),
+      h(
+        "div",
+        { className: "bv-row-end" },
+        saved && !dirty && h("span", { className: "text-caption text-subtle", style: { marginRight: "auto" } }, "Saved"),
+        h(Button, { variant: "subtle", disabled: !dirty, onClick: () => setDraft({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey }) }, "Discard"),
+        h(Button, { type: "submit", variant: "prominent", disabled: !dirty || invalid }, "Save"),
+      ),
+    );
+  }
+
+  function TtsApiForm({ settings }: { settings: Settings }) {
+    const [draft, setDraft] = useState({
+      ttsUrl: settings.ttsUrl,
+      ttsModel: settings.ttsModel,
+      ttsVoice: settings.ttsVoice,
+      ttsKey: settings.ttsKey,
+    });
+    const [saved, setSaved] = useState(false);
+    useEffect(
+      () => setDraft({ ttsUrl: settings.ttsUrl, ttsModel: settings.ttsModel, ttsVoice: settings.ttsVoice, ttsKey: settings.ttsKey }),
+      [settings.ttsUrl, settings.ttsModel, settings.ttsVoice, settings.ttsKey],
+    );
+    const dirty =
+      draft.ttsUrl !== settings.ttsUrl ||
+      draft.ttsModel !== settings.ttsModel ||
+      draft.ttsVoice !== settings.ttsVoice ||
+      draft.ttsKey !== settings.ttsKey;
+    const invalid = draft.ttsUrl.trim() !== "" && !/^https?:\/\/[^\s]+$/i.test(draft.ttsUrl.trim());
+    const set = (key: keyof typeof draft) => (event: any) => {
+      setSaved(false);
+      setDraft({ ...draft, [key]: event.target.value });
+    };
+    return h(
+      "form",
+      {
+        className: "bv-form",
+        noValidate: true,
+        onSubmit: (event: any) => {
+          event.preventDefault();
+          if (invalid) return;
+          controller.updateSettings({
+            ttsUrl: draft.ttsUrl.trim(),
+            ttsModel: draft.ttsModel.trim() || "kokoro",
+            ttsVoice: draft.ttsVoice.trim() || "af_heart",
+            ttsKey: draft.ttsKey.trim(),
+          });
+          setSaved(true);
+        },
+      },
+      h(
+        Field,
+        { label: "TTS Endpoint", description: "OpenAI-compatible /v1/audio/speech base URL (Kokoro-FastAPI, Speaches, Piper HTTP, Orpheus, OpenAI)." },
+        h(Input, { value: draft.ttsUrl, onChange: set("ttsUrl"), placeholder: "http://localhost:8880/v1", spellCheck: false, autoCapitalize: "off", autoCorrect: "off" }),
+      ),
+      invalid && h("p", { className: "buzz-field-error text-caption text-danger", role: "alert", style: { margin: 0 } }, "Enter a URL starting with http:// or https://."),
+      h(Field, { label: "TTS Model" }, h(Input, { value: draft.ttsModel, onChange: set("ttsModel"), placeholder: "kokoro", spellCheck: false })),
+      h(Field, { label: "Voice" }, h(Input, { value: draft.ttsVoice, onChange: set("ttsVoice"), placeholder: "af_heart", spellCheck: false })),
+      h(Field, { label: "API key", description: "Optional. Stored on this device only." }, h(Input, { type: "password", value: draft.ttsKey, onChange: set("ttsKey"), autoComplete: "off" })),
+      h(
+        "div",
+        { className: "bv-row-end" },
+        saved && !dirty && h("span", { className: "text-caption text-subtle", style: { marginRight: "auto" } }, "Saved"),
+        h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test"),
+        h(Button, { variant: "subtle", disabled: !dirty, onClick: () => setDraft({ ttsUrl: settings.ttsUrl, ttsModel: settings.ttsModel, ttsVoice: settings.ttsVoice, ttsKey: settings.ttsKey }) }, "Discard"),
+        h(Button, { type: "submit", variant: "prominent", disabled: !dirty || invalid }, "Save"),
+      ),
+    );
+  }
+
   function SettingsCard() {
     const voice = useVoice();
     const settings = voice.settings;
@@ -1365,41 +1533,85 @@ export function createUi(deps: UiDeps) {
       "section",
       { className: "bv-settings", "aria-labelledby": "bv-settings-title" },
       h("style", null, CSS),
-      h(Header, { title: "Buzz Voice", subtitle: "Talk to Buzz and find threads by emoji." }),
-      h(Header, { inline: true, title: "Speech to text" }),
+      h(Header, { title: "Buzz Voice", subtitle: "Live reactive voice assistant with pluggable LLM, STT, and TTS." }),
+
+      h(Header, { inline: true, title: "Live conversation & reactivity" }),
       h(
         Group,
         null,
         h(Row, {
-          title: "Speech engine",
-          subtitle: h("span", { className: voice.engineError ? "text-danger" : undefined }, status),
-          trailing: h(
-            Button,
-            {
-              variant: ready ? "subtle" : "prominent",
-              size: "sm",
-              loading: !!voice.installing,
-              onClick: () => void (ready ? controller.refreshEngine() : controller.install()),
+          title: "Interrupt while speaking (barge-in)",
+          subtitle: "Keep listening during playback so talking immediately cuts off speech and starts a new turn.",
+          trailing: h(Switch, { label: "Interrupt while speaking", checked: settings.bargeIn, onChange: (next: boolean) => controller.updateSettings({ bargeIn: next }) }),
+        }),
+        h(Row, {
+          title: "Confirm before sending",
+          subtitle: "Show an editable card before posting messages or editing todos. Turn off for instant hands-free sending.",
+          trailing: h(Switch, { label: "Confirm before sending", checked: settings.confirmBeforeSend, onChange: (next: boolean) => controller.updateSettings({ confirmBeforeSend: next }) }),
+        }),
+        h(Row, {
+          title: "Subtle audio cues",
+          subtitle: "Play a soft tone when Live starts or when you interrupt.",
+          trailing: h(Switch, { label: "Subtle audio cues", checked: settings.audioCues, onChange: (next: boolean) => controller.updateSettings({ audioCues: next }) }),
+        }),
+        h(Row, {
+          title: "Pause before replying (ms)",
+          subtitle: "Silence duration in Live mode before sending your utterance. Lower is snappier (350–500 ms recommended).",
+          trailing: h(Input, {
+            type: "number",
+            "aria-label": "VAD silence milliseconds",
+            min: 200,
+            max: 1500,
+            step: 50,
+            value: settings.vadSilenceMs,
+            style: { width: "6.5rem" },
+            onChange: (e: any) => {
+              const v = Number(e.target.value);
+              if (Number.isFinite(v) && v >= 200 && v <= 1500) controller.updateSettings({ vadSilenceMs: v });
             },
-            ready ? "Check" : "Install",
-          ),
+          }),
         }),
       ),
+
+      h(Header, { inline: true, title: "Speech to text (STT)" }),
       h(
         Group,
         null,
         h(Row, {
-          title: "Fast speech and hands-free",
+          title: "STT backend",
+          subtitle: "Local Whisper runs offline; OpenAI-compatible API uses your own LAN or cloud STT server while keeping local Silero VAD for instant turn detection.",
+          trailing: h(Segmented, {
+            label: "STT backend",
+            compact: true,
+            value: settings.sttBackend,
+            options: [
+              ["local", "Local"],
+              ["openai", "API"],
+            ],
+            onChange: (v: string) => controller.updateSettings({ sttBackend: v as "local" | "openai" }),
+          }),
+        }),
+        h(Row, {
+          title: "Fast speech runtime (Silero VAD)",
           subtitle: engine?.runtime
-            ? "Ready. Whisper stays loaded between sentences, and hands-free listens for the wake word."
-            : "Keeps whisper loaded so replies start sooner, and turns on hands-free. Needs python3; installs into the model folder.",
+            ? "Ready. Powers Live mode, barge-in, wake-word hands-free, and instant local decoding."
+            : "Required for Live mode and hands-free. Needs python3; installs sherpa-onnx + Silero VAD into the model folder.",
           trailing: engine?.runtime
-            ? h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() })
-            : h(Button, { variant: "subtle", size: "sm", loading: !!voice.installing, disabled: !ready, onClick: () => void controller.install() }, "Install"),
+            ? h(Switch, { label: "Live mode", checked: voice.liveMode, onChange: () => controller.toggleLiveMode() })
+            : h(
+                Button,
+                {
+                  variant: "prominent",
+                  size: "sm",
+                  loading: !!voice.installing,
+                  onClick: () => void (settings.sttBackend === "openai" ? controller.installRuntimeOnly() : controller.install()),
+                },
+                "Install",
+              ),
         }),
         h(Row, {
           title: "Wake word",
-          subtitle: `Say “hey ${settings.wakeWord.trim() || "buzz"}, ...” to give a command hands-free.`,
+          subtitle: `Used in wake-word hands-free mode: say “hey ${settings.wakeWord.trim() || "buzz"}, ...”.`,
           trailing: h(Input, {
             "aria-label": "Wake word",
             value: settings.wakeWord,
@@ -1409,37 +1621,148 @@ export function createUi(deps: UiDeps) {
           }),
         }),
       ),
-      h(Group, { layout: "form" }, h(SpeechForm, { settings })),
+      settings.sttBackend === "openai"
+        ? h(Group, { layout: "form" }, h(SttApiForm, { settings }))
+        : h(
+            Fragment,
+            null,
+            h(
+              Group,
+              null,
+              h(Row, {
+                title: "Local Whisper engine",
+                subtitle: h("span", { className: voice.engineError ? "text-danger" : undefined }, status),
+                trailing: h(
+                  Button,
+                  {
+                    variant: ready ? "subtle" : "prominent",
+                    size: "sm",
+                    loading: !!voice.installing,
+                    onClick: () => void (ready ? controller.refreshEngine() : controller.install()),
+                  },
+                  ready ? "Check" : "Install",
+                ),
+              }),
+            ),
+            h(Group, { layout: "form" }, h(SpeechForm, { settings })),
+          ),
+
       h(Header, {
         inline: true,
         title: "Language model",
-        subtitle: "Writes messages and reads channels back. Routing uses your Decisions API provider when one is on.",
+        subtitle: "Streams conversational replies and Buzz tool calls in Live mode. Any OpenAI-compatible endpoint works.",
       }),
       h(LlmForm, { settings }),
-      h(Header, { inline: true, title: "Microphone" }),
-      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
-      h(Header, { inline: true, title: "Spoken replies" }),
+
+      h(Header, { inline: true, title: "Spoken replies (TTS)" }),
       h(
         Group,
         null,
         h(Row, {
           title: "Read replies out loud",
-          subtitle: "Answers and new replies in watched threads.",
+          subtitle: "Streams spoken answers sentence-by-sentence through WebAudio for echo cancellation and barge-in.",
           trailing: h(Switch, { label: "Read replies out loud", checked: settings.speak, onChange: (next: boolean) => controller.updateSettings({ speak: next }) }),
         }),
         h(Row, {
-          title: "Voice",
-          subtitle: "Download better voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
-          trailing: h(VoicePicker, { value: settings.voice }),
+          title: "TTS backend",
+          subtitle: "Use System voice, a local sherpa-onnx neural voice (Kokoro / Piper), or any OpenAI-compatible /v1/audio/speech server.",
+          trailing: h(Segmented, {
+            label: "TTS backend",
+            value: settings.ttsBackend,
+            options: [
+              ["system", "System"],
+              ["local", "Local"],
+              ["openai", "API"],
+            ],
+            onChange: (v: string) => controller.updateSettings({ ttsBackend: v as "system" | "local" | "openai" }),
+          }),
         }),
+        h(Row, {
+          title: "Speaking speed",
+          subtitle: "1.0 is normal speed (0.5 to 2.0).",
+          trailing: h(Input, {
+            type: "number",
+            "aria-label": "Speaking speed",
+            min: 0.5,
+            max: 2.0,
+            step: 0.1,
+            value: settings.ttsSpeed,
+            style: { width: "6rem" },
+            onChange: (e: any) => {
+              const v = Number(e.target.value);
+              if (Number.isFinite(v) && v >= 0.5 && v <= 2.0) controller.updateSettings({ ttsSpeed: v });
+            },
+          }),
+        }),
+        settings.ttsBackend === "system" &&
+          h(Row, {
+            title: "System voice",
+            subtitle: "Download enhanced voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
+            trailing: h(VoicePicker, { value: settings.voice }),
+          }),
+        settings.ttsBackend === "local" &&
+          h(
+            Fragment,
+            null,
+            h(Row, {
+              title: "Local neural voice model",
+              subtitle: engine?.ttsModel
+                ? `Installed (${settings.localTtsModel}). Stays loaded in memory for fast offline speech.`
+                : `Not installed yet. Downloads ${settings.localTtsModel} from sherpa-onnx releases.`,
+              trailing: h(
+                "div",
+                { className: "bv-row" },
+                h(
+                  "select",
+                  {
+                    "aria-label": "Local TTS model",
+                    "data-buzz-ui": "",
+                    className: "buzz-input",
+                    "data-size": "md",
+                    value: settings.localTtsModel,
+                    onChange: (e: any) => controller.updateSettings({ localTtsModel: e.target.value }),
+                  },
+                  h("option", { value: "kokoro-en-v0_19" }, "Kokoro English (11 voices)"),
+                  h("option", { value: "vits-piper-en_US-lessac-medium" }, "Piper Lessac (fast, light)"),
+                  !["kokoro-en-v0_19", "vits-piper-en_US-lessac-medium"].includes(settings.localTtsModel) &&
+                    h("option", { value: settings.localTtsModel }, settings.localTtsModel),
+                ),
+                !engine?.ttsModel &&
+                  h(Button, { variant: "prominent", size: "sm", loading: !!voice.installing, onClick: () => void controller.installLocalTts() }, "Install"),
+                h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test"),
+              ),
+            }),
+            h(Row, {
+              title: "Speaker ID",
+              subtitle: "For multi-speaker models like Kokoro (0–10).",
+              trailing: h(Input, {
+                type: "number",
+                "aria-label": "Speaker ID",
+                min: 0,
+                max: 99,
+                value: settings.localTtsSpeaker,
+                style: { width: "5.5rem" },
+                onChange: (e: any) => {
+                  const v = Number(e.target.value);
+                  if (Number.isInteger(v) && v >= 0) controller.updateSettings({ localTtsSpeaker: v });
+                },
+              }),
+            }),
+          ),
       ),
+      settings.ttsBackend === "openai" && h(Group, { layout: "form" }, h(TtsApiForm, { settings })),
+
+      h(Header, { inline: true, title: "Microphone" }),
+      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
+
       h(Header, { inline: true, title: "Shortcuts" }),
       h(
         Group,
         null,
-        h(Row, { title: "Start or stop talking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧Space") }),
-        h(Row, { title: "Stop speaking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧.") }),
-        h(Row, { title: "Hands-free on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧H") }),
+        h(Row, { title: "Live conversation on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧L") }),
+        h(Row, { title: "Start or stop talking (push to talk)", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧Space") }),
+        h(Row, { title: "Stop speaking / interrupt", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧.") }),
+        h(Row, { title: "Wake-word hands-free on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "⌘⇧H") }),
       ),
     );
   }

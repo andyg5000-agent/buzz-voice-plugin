@@ -2,7 +2,7 @@
   "id": "blueoi.buzz-voice",
   "name": "Buzz Voice",
   "apiVersion": 1,
-  "description": "Talk to Buzz, hands-free or push to talk: speak a task or a todo, confirm it, and it lands in the right channel and thread. Ask how work is going and hear the answer. Find threads by emoji.",
+  "description": "Live, reactive voice assistant for Buzz with barge-in, streaming replies, and pluggable LLM, STT, and TTS backends. Talk hands-free or push to talk, manage todos, and find threads by emoji.",
   "discovery": {
     "category": "productivity",
     "tags": [
@@ -23,6 +23,15 @@
           "-c",
           "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\nn=${2:-small.en}\nw=$d/sherpa-onnx-whisper-$n\nb=$d/sherpa-onnx/bin/sherpa-onnx-offline\n[ -x \"$b\" ] || b=$(command -v sherpa-onnx-offline) || { echo '{\"error\":\"no-engine\"}'; exit 0; }\n[ -f \"$w/$n-tokens.txt\" ] || { echo '{\"error\":\"no-model\"}'; exit 0; }\nf=$(mktemp \"${TMPDIR:-/tmp}/buzz-voice.XXXXXX\") || exit 1\ntrap 'rm -f \"$f\"' EXIT\nopenssl base64 -d -A > \"$f\" || exit 1\n\"$b\" --whisper-encoder=\"$w/$n-encoder.int8.onnx\" --whisper-decoder=\"$w/$n-decoder.int8.onnx\" --tokens=\"$w/$n-tokens.txt\" --whisper-language=en --whisper-task=transcribe --num-threads=4 \"$f\" | grep '^{'",
           "buzz-voice-stt"
+        ]
+      },
+      {
+        "id": "stt-http",
+        "program": "sh",
+        "args": [
+          "-c",
+          "u=$1; m=${2:-whisper-1}; k=$3\nf=$(mktemp \"${TMPDIR:-/tmp}/bv-stt.XXXXXX\") || exit 1\ntrap 'rm -f \"$f\"' EXIT\nopenssl base64 -d -A > \"$f\" || exit 1\nif [ -n \"$k\" ]; then\ncurl -fsS --max-time 60 -H \"Authorization: Bearer $k\" -F \"file=@$f;filename=audio.wav;type=audio/wav\" -F \"model=$m\" \"$u\"\nelse\ncurl -fsS --max-time 60 -F \"file=@$f;filename=audio.wav;type=audio/wav\" -F \"model=$m\" \"$u\"\nfi",
+          "buzz-voice-stt-http"
         ]
       },
       {
@@ -55,6 +64,42 @@
       {
         "id": "say",
         "program": "say"
+      },
+      {
+        "id": "tts-say",
+        "program": "sh",
+        "args": [
+          "-c",
+          "command -v say >/dev/null || exit 127\nf=$(mktemp \"${TMPDIR:-/tmp}/bv-say.XXXXXX\") || exit 1\ntrap 'rm -f \"$f\"' EXIT\nif [ -n \"$1\" ]; then\nsay -v \"$1\" -r \"${2:-190}\" -o \"$f\" --file-format=WAVE --data-format=LEI16@24000 -f - || exit 1\nelse\nsay -r \"${2:-190}\" -o \"$f\" --file-format=WAVE --data-format=LEI16@24000 -f - || exit 1\nfi\nopenssl base64 -A < \"$f\"",
+          "buzz-voice-tts-say"
+        ]
+      },
+      {
+        "id": "tts-http",
+        "program": "sh",
+        "args": [
+          "-c",
+          "u=$1; k=$2\nf=$(mktemp \"${TMPDIR:-/tmp}/bv-tts.XXXXXX\") || exit 1\ntrap 'rm -f \"$f\"' EXIT\nif [ -n \"$k\" ]; then\ncurl -fsS --max-time 60 -H \"Content-Type: application/json\" -H \"Authorization: Bearer $k\" --data-binary @- -o \"$f\" \"$u\" || exit 1\nelse\ncurl -fsS --max-time 60 -H \"Content-Type: application/json\" --data-binary @- -o \"$f\" \"$u\" || exit 1\nfi\nopenssl base64 -A < \"$f\"",
+          "buzz-voice-tts-http"
+        ]
+      },
+      {
+        "id": "tts-local",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\np=$d/venv/bin/python3\n[ -x \"$p\" ] || { echo '{\"error\":\"no-runtime\"}'; exit 0; }\nexec \"$p\" -I -u -c \"$3\" \"$d\" \"${2:-kokoro-en-v0_19}\"",
+          "buzz-voice-tts-local"
+        ]
+      },
+      {
+        "id": "tts-setup",
+        "program": "sh",
+        "args": [
+          "-c",
+          "d=${1:-$HOME/buzz-voice-models}\ncase $d in \"~/\"*) d=$HOME/${d#\"~/\"};; esac\nm=${3:-kokoro-en-v0_19}\nr=https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models\nhas() { [ -d \"$d/$m\" ] && ls \"$d/$m\"/*.onnx >/dev/null 2>&1 && [ -f \"$d/$m/tokens.txt\" ]; }\nif [ \"$2\" = install ] && ! has; then\nset -e; mkdir -p \"$d\"; cd \"$d\"\necho \"progress tts-model\"\ncurl -fsSL \"$r/$m.tar.bz2\" | tar xjf -\nset +e\nfi\nif has; then echo '{\"ttsModel\":true}'; else echo '{\"ttsModel\":false}'; fi",
+          "buzz-voice-tts-setup"
+        ]
       },
       {
         "id": "llm",

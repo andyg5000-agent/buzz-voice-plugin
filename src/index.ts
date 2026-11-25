@@ -37,7 +37,26 @@ export function apply(ctx: any): void {
     decide,
     community: () => scopeOf(ctx.relay.snapshot())?.communityOrigin,
   });
+
   ctx.effect(() => controller.start(), "buzz-voice controller");
+  ctx.effect(() => ctx.relay.subscribe(() => controller.onRelayChanged()), "buzz-voice relay sync");
+
+  // Auto-pause mic/Live mode when a native Buzz Huddle is active
+  ctx.effect(() => {
+    const huddleStatus = optional(ctx, "huddleStatus");
+    if (!huddleStatus?.subscribe || !huddleStatus?.snapshot) return undefined;
+    const sync = () => {
+      try {
+        const snap = huddleStatus.snapshot();
+        const active = !!(snap?.active || snap?.inHuddle || snap?.state === "connected" || snap?.channelId);
+        controller.setHuddleActive(active);
+      } catch {
+        // ignore
+      }
+    };
+    sync();
+    return huddleStatus.subscribe(sync);
+  }, "buzz-voice huddle auto-pause");
 
   const { Page, SettingsCard } = createUi({
     React: ctx.react,
@@ -49,6 +68,13 @@ export function apply(ctx: any): void {
 
   ctx.pages.register({ id: "main", title: "Buzz Voice", primary: true, component: Page });
   ctx.settingsCards.register({ id: "settings", title: "Buzz Voice", component: SettingsCard, personal: true });
+  ctx.shortcuts.register({
+    id: "live",
+    title: "Buzz Voice: Live conversation on or off",
+    binding: { key: "l", mod: true, shift: true },
+    allowInEditable: true,
+    run: () => controller.toggleLiveMode(),
+  });
   ctx.shortcuts.register({
     id: "talk",
     title: "Buzz Voice: start or stop talking",
@@ -67,7 +93,7 @@ export function apply(ctx: any): void {
   });
   ctx.shortcuts.register({
     id: "stop-speaking",
-    title: "Buzz Voice: stop speaking",
+    title: "Buzz Voice: stop speaking / interrupt",
     binding: { key: ".", mod: true, shift: true },
     allowInEditable: true,
     run: () => controller.stopSpeaking(),

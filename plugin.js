@@ -6,22 +6,620 @@ var __export = (target, all2) => {
 };
 
 // scripts/listen.py
-var listen_default = 'import base64, json, os, sys, time\nimport numpy as np\nimport sherpa_onnx\n\nd, n = sys.argv[1], sys.argv[2]\nsilence = float(sys.argv[3]) if len(sys.argv) > 3 else 0.6\nrate = 16000\nw = os.path.join(d, f"sherpa-onnx-whisper-{n}", n)\n\n\ndef out(**msg):\n    sys.stdout.write(json.dumps(msg) + "\\n")\n    sys.stdout.flush()\n\n\nstarted = time.time()\nrecognizer = sherpa_onnx.OfflineRecognizer.from_whisper(\n    encoder=f"{w}-encoder.int8.onnx",\n    decoder=f"{w}-decoder.int8.onnx",\n    tokens=f"{w}-tokens.txt",\n    language="en",\n    task="transcribe",\n    num_threads=4,\n)\nconfig = sherpa_onnx.VadModelConfig()\nconfig.silero_vad.model = os.path.join(d, "silero_vad.onnx")\nconfig.silero_vad.threshold = 0.5\nconfig.silero_vad.min_silence_duration = silence\nconfig.silero_vad.min_speech_duration = 0.25\nconfig.silero_vad.max_speech_duration = 30\nconfig.sample_rate = rate\nwindow = config.silero_vad.window_size\nvad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=120)\npending = np.zeros(0, dtype=np.float32)\nspeaking = False\nparts = {}\n\n\ndef decode(samples):\n    t = time.time()\n    stream = recognizer.create_stream()\n    stream.accept_waveform(rate, samples)\n    recognizer.decode_stream(stream)\n    return stream.result.text.strip(), int((time.time() - t) * 1000)\n\n\ndef pcm(data):\n    return np.frombuffer(base64.b64decode(data), dtype="<i2").astype(np.float32) / 32768\n\n\nout(ready=True, ms=int((time.time() - started) * 1000))\nfor line in sys.stdin:\n    op, _, rest = line.strip().partition(" ")\n    try:\n        if op == "a":\n            pending = np.concatenate([pending, pcm(rest)])\n            while len(pending) >= window:\n                vad.accept_waveform(pending[:window])\n                pending = pending[window:]\n                if vad.is_speech_detected() != speaking:\n                    speaking = not speaking\n                    out(speech=speaking)\n                while not vad.empty():\n                    samples = np.array(vad.front.samples, dtype=np.float32)\n                    vad.pop()\n                    text, ms = decode(samples)\n                    out(text=text, ms=ms, seconds=round(len(samples) / rate, 2))\n        elif op == "p":\n            ref, _, data = rest.partition(" ")\n            parts.setdefault(ref, []).append(pcm(data))\n        elif op == "d":\n            ref = rest\n            chunks = parts.pop(ref, [])\n            samples = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)\n            text, ms = decode(samples)\n            out(id=ref, text=text, ms=ms)\n        elif op == "r":\n            vad.reset()\n            pending = np.zeros(0, dtype=np.float32)\n            if speaking:\n                speaking = False\n                out(speech=False)\n    except Exception as error:\n        if op == "d":\n            out(id=rest, error=str(error))\n        else:\n            out(error=str(error))\n';
+var listen_default = `import base64, io, json, os, sys, time, urllib.error, urllib.request, uuid, wave
+import numpy as np
+import sherpa_onnx
+
+d, n = sys.argv[1], sys.argv[2]
+silence = float(sys.argv[3]) if len(sys.argv) > 3 else 0.6
+rate = 16000
+
+cfg = {
+    "stt_mode": "local",
+    "stt_url": "",
+    "stt_model": "whisper-1",
+    "stt_key": "",
+    "whisper": n,
+    "silence": silence,
+}
+
+
+def out(**msg):
+    sys.stdout.write(json.dumps(msg) + "\\n")
+    sys.stdout.flush()
+
+
+recognizer = None
+loaded_whisper = None
+
+
+def ensure_recognizer():
+    global recognizer, loaded_whisper
+    name = cfg["whisper"] or "small.en"
+    if recognizer is not None and loaded_whisper == name:
+        return recognizer
+    w = os.path.join(d, f"sherpa-onnx-whisper-{name}", name)
+    recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+        encoder=f"{w}-encoder.int8.onnx",
+        decoder=f"{w}-decoder.int8.onnx",
+        tokens=f"{w}-tokens.txt",
+        language="en",
+        task="transcribe",
+        num_threads=4,
+    )
+    loaded_whisper = name
+    return recognizer
+
+
+def make_vad(min_silence):
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = os.path.join(d, "silero_vad.onnx")
+    config.silero_vad.threshold = 0.5
+    config.silero_vad.min_silence_duration = max(0.15, min(2.0, float(min_silence)))
+    config.silero_vad.min_speech_duration = 0.2
+    config.silero_vad.max_speech_duration = 30
+    config.sample_rate = rate
+    return sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=120), config.silero_vad.window_size
+
+
+def wav_bytes(samples):
+    clipped = np.clip(samples, -1.0, 1.0)
+    pcm16 = (clipped * 32767.0).astype("<i2").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm16)
+    return buf.getvalue()
+
+
+def decode_openai(samples):
+    base = cfg["stt_url"].rstrip("/")
+    url = base if base.endswith("/audio/transcriptions") else f"{base}/audio/transcriptions"
+    boundary = f"----BuzzVoice{uuid.uuid4().hex}"
+    audio = wav_bytes(samples)
+    parts = [
+        f"--{boundary}\\r\\nContent-Disposition: form-data; name=\\"model\\"\\r\\n\\r\\n{cfg['stt_model'] or 'whisper-1'}\\r\\n".encode("utf-8"),
+        f"--{boundary}\\r\\nContent-Disposition: form-data; name=\\"response_format\\"\\r\\n\\r\\njson\\r\\n".encode("utf-8"),
+        f"--{boundary}\\r\\nContent-Disposition: form-data; name=\\"file\\"; filename=\\"audio.wav\\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n".encode("utf-8") + audio + b"\\r\\n",
+        f"--{boundary}--\\r\\n".encode("utf-8"),
+    ]
+    body = b"".join(parts)
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    if cfg["stt_key"]:
+        headers["Authorization"] = f"Bearer {cfg['stt_key']}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+    try:
+        parsed = json.loads(raw)
+        return str(parsed.get("text", "")).strip()
+    except Exception:
+        return raw
+
+
+def decode(samples):
+    t = time.time()
+    if cfg["stt_mode"] == "openai" and cfg["stt_url"]:
+        text = decode_openai(samples)
+    else:
+        rec = ensure_recognizer()
+        stream = rec.create_stream()
+        stream.accept_waveform(rate, samples)
+        rec.decode_stream(stream)
+        text = stream.result.text.strip()
+    return text, int((time.time() - t) * 1000)
+
+
+def pcm(data):
+    return np.frombuffer(base64.b64decode(data), dtype="<i2").astype(np.float32) / 32768
+
+
+started = time.time()
+vad, window = make_vad(silence)
+# Preload local whisper only when local model files exist; openai mode skips preload via c command
+w_default = os.path.join(d, f"sherpa-onnx-whisper-{n}", f"{n}-tokens.txt")
+if n != "__none__" and os.path.isfile(w_default):
+    ensure_recognizer()
+
+pending = np.zeros(0, dtype=np.float32)
+speaking = False
+parts = {}
+
+out(ready=True, ms=int((time.time() - started) * 1000))
+for line in sys.stdin:
+    op, _, rest = line.strip().partition(" ")
+    try:
+        if op == "a":
+            pending = np.concatenate([pending, pcm(rest)])
+            while len(pending) >= window:
+                vad.accept_waveform(pending[:window])
+                pending = pending[window:]
+                if vad.is_speech_detected() != speaking:
+                    speaking = not speaking
+                    out(speech=speaking)
+                while not vad.empty():
+                    samples = np.array(vad.front.samples, dtype=np.float32)
+                    vad.pop()
+                    text, ms = decode(samples)
+                    out(text=text, ms=ms, seconds=round(len(samples) / rate, 2))
+        elif op == "p":
+            ref, _, data = rest.partition(" ")
+            parts.setdefault(ref, []).append(pcm(data))
+        elif op == "d":
+            ref = rest
+            chunks = parts.pop(ref, [])
+            samples = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+            text, ms = decode(samples)
+            out(id=ref, text=text, ms=ms)
+        elif op == "r":
+            vad.reset()
+            pending = np.zeros(0, dtype=np.float32)
+            if speaking:
+                speaking = False
+                out(speech=False)
+        elif op == "c":
+            patch = json.loads(rest)
+            prev_silence = cfg["silence"]
+            for key in ("stt_mode", "stt_url", "stt_model", "stt_key", "whisper", "silence"):
+                if key in patch and patch[key] is not None:
+                    cfg[key] = patch[key]
+            if abs(float(cfg["silence"]) - float(prev_silence)) > 0.01:
+                vad, window = make_vad(cfg["silence"])
+                pending = np.zeros(0, dtype=np.float32)
+                if speaking:
+                    speaking = False
+                    out(speech=False)
+            if cfg["stt_mode"] == "local":
+                ensure_recognizer()
+            out(configured=True)
+        elif op == "s":
+            cfg["silence"] = float(rest)
+            vad, window = make_vad(cfg["silence"])
+            pending = np.zeros(0, dtype=np.float32)
+            if speaking:
+                speaking = False
+                out(speech=False)
+    except Exception as error:
+        if op == "d":
+            out(id=rest, error=str(error))
+        else:
+            out(error=str(error))
+`;
+
+// scripts/tts.py
+var tts_default = 'import base64, glob, json, os, sys, time\nimport numpy as np\nimport sherpa_onnx\n\nd = sys.argv[1]\nmodel_name = sys.argv[2] if len(sys.argv) > 2 else "kokoro-en-v0_19"\nmodel_dir = os.path.join(d, model_name)\n\n\ndef out(**msg):\n    sys.stdout.write(json.dumps(msg) + "\\n")\n    sys.stdout.flush()\n\n\nif not os.path.isdir(model_dir):\n    out(error="no-model")\n    sys.exit(0)\n\nonnx_files = sorted(glob.glob(os.path.join(model_dir, "*.onnx")))\ntokens = os.path.join(model_dir, "tokens.txt")\nif not onnx_files or not os.path.isfile(tokens):\n    out(error="no-model")\n    sys.exit(0)\n\ndata_dir = os.path.join(model_dir, "espeak-ng-data")\nif not os.path.isdir(data_dir):\n    data_dir = ""\n\nvoices = os.path.join(model_dir, "voices.bin")\nlexicon = os.path.join(model_dir, "lexicon.txt")\nif not os.path.isfile(lexicon):\n    lexicon = ""\n\nstarted = time.time()\ntry:\n    if os.path.isfile(voices):\n        model_cfg = sherpa_onnx.OfflineTtsModelConfig(\n            kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(\n                model=onnx_files[0],\n                voices=voices,\n                tokens=tokens,\n                data_dir=data_dir,\n            ),\n            num_threads=4,\n            debug=False,\n        )\n    else:\n        model_cfg = sherpa_onnx.OfflineTtsModelConfig(\n            vits=sherpa_onnx.OfflineTtsVitsModelConfig(\n                model=onnx_files[0],\n                lexicon=lexicon,\n                tokens=tokens,\n                data_dir=data_dir,\n            ),\n            num_threads=4,\n            debug=False,\n        )\n    tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(model=model_cfg))\nexcept Exception as err:\n    out(error=str(err))\n    sys.exit(1)\n\nout(\n    ready=True,\n    rate=int(tts.sample_rate),\n    speakers=int(getattr(tts, "num_speakers", 1)),\n    ms=int((time.time() - started) * 1000),\n)\n\nfor line in sys.stdin:\n    raw = line.strip()\n    if not raw:\n        continue\n    req_id = ""\n    try:\n        req = json.loads(raw)\n        req_id = str(req.get("id", ""))\n        text = str(req.get("text", "")).strip()\n        sid = int(req.get("sid", 0))\n        speed = float(req.get("speed", 1.0))\n        if not text:\n            out(id=req_id, rate=int(tts.sample_rate), pcm="", ms=0)\n            continue\n        t = time.time()\n        audio = tts.generate(text, sid=sid, speed=max(0.5, min(2.0, speed)))\n        samples = np.asarray(audio.samples, dtype=np.float32)\n        pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()\n        out(\n            id=req_id,\n            rate=int(audio.sample_rate),\n            pcm=base64.b64encode(pcm16).decode("ascii"),\n            ms=int((time.time() - t) * 1000),\n        )\n    except Exception as err:\n        out(id=req_id, error=str(err))\n';
+
+// src/audio.ts
+function fromBase64(base64) {
+  const clean2 = base64.replace(/\s+/g, "");
+  if (!clean2) return new Uint8Array(0);
+  const binary = atob(clean2);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function isEncodedAudio(bytes) {
+  if (bytes.length < 4) return false;
+  if (bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70) return true;
+  if (bytes[0] === 79 && bytes[1] === 103 && bytes[2] === 103 && bytes[3] === 83) return true;
+  if (bytes[0] === 102 && bytes[1] === 76 && bytes[2] === 97 && bytes[3] === 67) return true;
+  if (bytes[0] === 73 && bytes[1] === 68 && bytes[2] === 51) return true;
+  if (bytes[0] === 255 && (bytes[1] & 224) === 224) return true;
+  if (bytes.length >= 8 && bytes[4] === 102 && bytes[5] === 116 && bytes[6] === 121 && bytes[7] === 112) return true;
+  return false;
+}
+var AudioPlayer = class {
+  ownContext = null;
+  sharedContext = () => null;
+  sources = /* @__PURE__ */ new Set();
+  nextTime = 0;
+  generation = 0;
+  onIdle = () => {
+  };
+  setSharedContext(getter) {
+    this.sharedContext = getter;
+  }
+  get playing() {
+    return this.sources.size > 0;
+  }
+  async context() {
+    const shared = this.sharedContext();
+    if (shared && shared.state !== "closed") {
+      if (shared.state === "suspended") await shared.resume().catch(() => void 0);
+      return shared;
+    }
+    if (!this.ownContext || this.ownContext.state === "closed") {
+      const Ctx = window.AudioContext ?? window.webkitAudioContext;
+      this.ownContext = new Ctx();
+    }
+    if (this.ownContext.state === "suspended") {
+      await this.ownContext.resume().catch(() => void 0);
+    }
+    return this.ownContext;
+  }
+  async decodeBytes(bytes, fallbackPcmRate = 24e3) {
+    if (bytes.length === 0) return null;
+    const ctx = await this.context();
+    if (isEncodedAudio(bytes)) {
+      const copy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return await ctx.decodeAudioData(copy);
+    }
+    return this.pcm16ToBuffer(ctx, bytes, fallbackPcmRate);
+  }
+  async decodePcm16(bytes, sampleRate) {
+    if (bytes.length < 2) return null;
+    const ctx = await this.context();
+    return this.pcm16ToBuffer(ctx, bytes, sampleRate);
+  }
+  pcm16ToBuffer(ctx, bytes, sampleRate) {
+    const count = Math.floor(bytes.byteLength / 2);
+    const buffer = ctx.createBuffer(1, Math.max(1, count), sampleRate);
+    const channel = buffer.getChannelData(0);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, count * 2);
+    for (let i = 0; i < count; i += 1) {
+      channel[i] = view.getInt16(i * 2, true) / 32768;
+    }
+    return buffer;
+  }
+  async playBuffer(buffer, generation) {
+    if (generation !== this.generation) return;
+    const ctx = await this.context();
+    if (generation !== this.generation) return;
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    const now2 = ctx.currentTime;
+    const startAt = Math.max(now2 + 0.01, this.nextTime);
+    this.nextTime = startAt + buffer.duration;
+    this.sources.add(source);
+    await new Promise((resolve) => {
+      source.onended = () => {
+        this.sources.delete(source);
+        try {
+          source.disconnect();
+        } catch {
+        }
+        if (this.sources.size === 0 && generation === this.generation) {
+          this.nextTime = 0;
+          this.onIdle();
+        }
+        resolve();
+      };
+      try {
+        source.start(startAt);
+      } catch {
+        this.sources.delete(source);
+        resolve();
+      }
+    });
+  }
+  /** Subtle synthesized audio cue so turn boundaries feel crisp without external audio assets. */
+  cue(kind) {
+    void this.context().then((ctx) => {
+      const now2 = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      if (kind === "wake") {
+        osc.frequency.setValueAtTime(520, now2);
+        osc.frequency.exponentialRampToValueAtTime(740, now2 + 0.06);
+      } else if (kind === "interrupt") {
+        osc.frequency.setValueAtTime(600, now2);
+        osc.frequency.exponentialRampToValueAtTime(420, now2 + 0.045);
+      } else {
+        osc.frequency.setValueAtTime(440, now2);
+        osc.frequency.exponentialRampToValueAtTime(520, now2 + 0.05);
+      }
+      gain.gain.setValueAtTime(1e-4, now2);
+      gain.gain.linearRampToValueAtTime(0.04, now2 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(1e-4, now2 + 0.07);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now2);
+      osc.stop(now2 + 0.08);
+    }).catch(() => void 0);
+  }
+  get currentGeneration() {
+    return this.generation;
+  }
+  /** Immediately halts all playing and scheduled buffers (<5ms). */
+  stop() {
+    const wasPlaying = this.sources.size > 0;
+    this.generation += 1;
+    this.nextTime = 0;
+    for (const source of this.sources) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+      }
+      try {
+        source.disconnect();
+      } catch {
+      }
+    }
+    this.sources.clear();
+    return wasPlaying;
+  }
+  close() {
+    this.stop();
+    if (this.ownContext) {
+      void this.ownContext.close().catch(() => void 0);
+      this.ownContext = null;
+    }
+  }
+};
+var WORKLET_CODE = `
+class BuzzVoiceCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.frame = new Float32Array(512);
+    this.offset = 0;
+  }
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (input) {
+      for (let i = 0; i < input.length; i++) {
+        this.frame[this.offset++] = input[i];
+        if (this.offset === this.frame.length) {
+          this.port.postMessage(this.frame);
+          this.frame = new Float32Array(512);
+          this.offset = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("buzz-voice-capture", BuzzVoiceCapture);
+`;
+async function attachCapture(context, source, onSamples) {
+  if (typeof AudioWorkletNode !== "undefined" && context.audioWorklet?.addModule) {
+    let url = null;
+    try {
+      url = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+      await context.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      url = null;
+      const worklet = new AudioWorkletNode(context, "buzz-voice-capture");
+      const sink2 = context.createGain();
+      sink2.gain.value = 0;
+      worklet.port.onmessage = ({ data }) => {
+        if (data && data.length) onSamples(data);
+      };
+      source.connect(worklet);
+      worklet.connect(sink2);
+      sink2.connect(context.destination);
+      return {
+        disconnect() {
+          worklet.port.onmessage = null;
+          try {
+            worklet.port.close();
+          } catch {
+          }
+          try {
+            source.disconnect(worklet);
+            worklet.disconnect();
+            sink2.disconnect();
+          } catch {
+          }
+        }
+      };
+    } catch {
+      if (url) URL.revokeObjectURL(url);
+    }
+  }
+  const node2 = context.createScriptProcessor(1024, 1, 1);
+  const sink = context.createGain();
+  sink.gain.value = 0;
+  node2.onaudioprocess = (event) => {
+    onSamples(new Float32Array(event.inputBuffer.getChannelData(0)));
+  };
+  source.connect(node2);
+  node2.connect(sink);
+  sink.connect(context.destination);
+  return {
+    disconnect() {
+      node2.onaudioprocess = null;
+      try {
+        source.disconnect(node2);
+        node2.disconnect();
+        sink.disconnect();
+      } catch {
+      }
+    }
+  };
+}
+
+// src/stream.ts
+function cleanForSpeech(text3) {
+  return text3.replace(/```[\s\S]*?```/g, " ").replace(/`([^`]+)`/g, "$1").replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/https?:\/\/\S+/g, " ").replace(/nostr:\S+/g, " ").replace(/[*_~#>|]+/g, "").replace(/\s+/g, " ").trim();
+}
+var ABBREV = /\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e|fig|no|vol)\.\s*$/i;
+var MIN_SENTENCE_CHARS = 18;
+var CLAUSE_SPLIT_AT = 85;
+var SentenceBuffer = class {
+  buf = "";
+  emittedAny = false;
+  push(delta, onSentence) {
+    if (!delta) return;
+    this.buf += delta;
+    this.drain(false, onSentence);
+  }
+  flush(onSentence) {
+    this.drain(true, onSentence);
+    const tail = cleanForSpeech(this.buf);
+    this.buf = "";
+    if (tail) onSentence(tail);
+  }
+  reset() {
+    this.buf = "";
+    this.emittedAny = false;
+  }
+  drain(final, onSentence) {
+    for (; ; ) {
+      const cut = this.findCut(final);
+      if (cut < 0) break;
+      const piece = cleanForSpeech(this.buf.slice(0, cut));
+      this.buf = this.buf.slice(cut);
+      if (piece) {
+        this.emittedAny = true;
+        onSentence(piece);
+      }
+    }
+  }
+  findCut(final) {
+    const fences = (this.buf.match(/```/g) ?? []).length;
+    if (!final && fences % 2 === 1) return -1;
+    const nl = this.buf.indexOf("\n");
+    if (nl >= 0) {
+      const before = this.buf.slice(0, nl).trim();
+      if (before.length >= 6 || this.emittedAny) return nl + 1;
+    }
+    const sentenceRe = /([.!?])(?:\s+|$)/g;
+    let match;
+    while ((match = sentenceRe.exec(this.buf)) !== null) {
+      const end = match.index + match[0].length;
+      if (!final && end === this.buf.length && !/\s$/.test(match[0])) continue;
+      const head = this.buf.slice(0, match.index + 1);
+      if (match[1] === "." && /\d$/.test(this.buf.slice(0, match.index)) && /^\d/.test(this.buf.slice(match.index + 1))) {
+        continue;
+      }
+      if (match[1] === "." && ABBREV.test(head)) continue;
+      if (head.trim().length >= MIN_SENTENCE_CHARS || this.emittedAny || match[1] !== ".") {
+        return end;
+      }
+    }
+    if (this.buf.length >= CLAUSE_SPLIT_AT) {
+      const clauseRe = /([;:]|—|--|,)\s+/g;
+      while ((match = clauseRe.exec(this.buf)) !== null) {
+        if (match.index >= 45) return match.index + match[0].length;
+      }
+    }
+    return -1;
+  }
+};
+var SseParser = class {
+  constructor(onDelta) {
+    this.onDelta = onDelta;
+  }
+  partial = "";
+  raw = "";
+  sawSse = false;
+  content = "";
+  finishReason = null;
+  calls = /* @__PURE__ */ new Map();
+  error = null;
+  feed(chunk2) {
+    this.raw += chunk2;
+    this.partial += chunk2;
+    const lines = this.partial.split(/\r?\n/);
+    this.partial = lines.pop() ?? "";
+    for (const line2 of lines) this.handleLine(line2);
+  }
+  finish() {
+    if (this.partial.trim()) this.handleLine(this.partial);
+    this.partial = "";
+    if (this.error) throw new Error(this.error);
+    if (!this.sawSse && this.raw.trim().startsWith("{")) {
+      const parsed = JSON.parse(this.raw.trim());
+      if (parsed?.error) throw new Error(parsed.error.message ?? String(parsed.error));
+      const choice = parsed?.choices?.[0];
+      const msg = choice?.message;
+      const text3 = typeof msg?.content === "string" ? msg.content : "";
+      if (text3) {
+        this.content = text3;
+        this.onDelta?.(text3);
+      }
+      const toolCalls2 = Array.isArray(msg?.tool_calls) ? msg.tool_calls.map((tc, idx) => ({
+        id: String(tc.id ?? `call_${idx}`),
+        name: String(tc.function?.name ?? ""),
+        arguments: typeof tc.function?.arguments === "string" ? tc.function.arguments : JSON.stringify(tc.function?.arguments ?? {})
+      })) : [];
+      return {
+        content: this.content,
+        toolCalls: toolCalls2,
+        finishReason: choice?.finish_reason ?? null
+      };
+    }
+    const toolCalls = [...this.calls.entries()].sort((a, b) => a[0] - b[0]).map(([, call]) => call).filter((call) => call.name);
+    return { content: this.content, toolCalls, finishReason: this.finishReason };
+  }
+  handleLine(line2) {
+    const trimmed = line2.trim();
+    if (!trimmed || trimmed.startsWith(":")) return;
+    if (!trimmed.startsWith("data:")) return;
+    this.sawSse = true;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (parsed?.error) {
+      this.error = parsed.error.message ?? String(parsed.error);
+      return;
+    }
+    const choice = parsed?.choices?.[0];
+    if (!choice) return;
+    if (choice.finish_reason) this.finishReason = String(choice.finish_reason);
+    const delta = choice.delta ?? choice.message;
+    if (!delta) return;
+    if (typeof delta.content === "string" && delta.content) {
+      this.content += delta.content;
+      this.onDelta?.(delta.content);
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const index2 = typeof tc.index === "number" ? tc.index : this.calls.size;
+        const entry = this.calls.get(index2) ?? {
+          id: `call_${index2}`,
+          name: "",
+          arguments: ""
+        };
+        if (typeof tc.id === "string" && tc.id) entry.id = tc.id;
+        if (typeof tc.function?.name === "string" && tc.function.name) entry.name += tc.function.name;
+        if (typeof tc.function?.arguments === "string") entry.arguments += tc.function.arguments;
+        this.calls.set(index2, entry);
+      }
+    }
+  }
+};
 
 // src/engine.ts
 var TARGET_RATE = 16e3;
-var TAP_SAMPLES = TARGET_RATE / 10;
+var TAP_SAMPLES = 512;
 var DEFAULT_SETTINGS = {
   modelDir: "~/buzz-voice-models",
   whisper: "small.en",
+  sttBackend: "local",
+  sttUrl: "",
+  sttModel: "whisper-1",
+  sttKey: "",
   llmUrl: "",
   llmModel: "",
   llmKey: "",
   voice: "",
   speak: true,
+  ttsBackend: "system",
+  ttsUrl: "",
+  ttsModel: "kokoro",
+  ttsVoice: "af_heart",
+  ttsKey: "",
+  ttsSpeed: 1,
+  localTtsModel: "kokoro-en-v0_19",
+  localTtsSpeaker: 0,
   microphone: "",
   handsFree: false,
-  wakeWord: "buzz"
+  wakeWord: "buzz",
+  vadSilenceMs: 420,
+  bargeIn: true,
+  confirmBeforeSend: true,
+  audioCues: true
 };
 var SETTINGS_KEY = "buzz-voice-plugin.settings";
 function storage() {
@@ -52,8 +650,9 @@ function loadJson(key, fallback) {
 function saveJson(key, value) {
   storage()?.setItem(key, JSON.stringify(value));
 }
-async function run(host, id, args, input, onLine) {
+async function run(host, id, args, input, onLine, signal) {
   if (!host.spawn) throw new Error("This Buzz build cannot start local processes.");
+  if (signal?.aborted) throw new Error("Aborted");
   let stdout = "";
   let stderr = "";
   let partial = "";
@@ -71,9 +670,18 @@ async function run(host, id, args, input, onLine) {
       stderr = (stderr + data).slice(-4e3);
     }
   });
-  await process.end(input ?? "");
-  const code = await process.exited;
-  return { code, stdout, stderr };
+  const onAbort = () => {
+    void process.kill().catch(() => void 0);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    await process.end(input ?? "");
+    const code = await process.exited;
+    if (signal?.aborted) throw new Error("Aborted");
+    return { code, stdout, stderr };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 function parseVoices(stdout) {
   const voices = [];
@@ -87,11 +695,11 @@ async function listVoices(host) {
   const result = await run(host, "say", ["-v", "?"]);
   return parseVoices(result.stdout);
 }
-function parseStatus(stdout, runtime) {
+function parseStatus(stdout, runtime, ttsModel) {
   const at = stdout.indexOf('{"engine"');
   if (at < 0) throw new Error("The setup script returned nothing.");
   const parsed = JSON.parse(stdout.slice(at).trim());
-  return { engine: !!parsed.engine, model: !!parsed.model, runtime, buzzVoice: parsed.buzzVoice ?? null };
+  return { engine: !!parsed.engine, model: !!parsed.model, runtime, ttsModel, buzzVoice: parsed.buzzVoice ?? null };
 }
 async function runtimeReady(host, settings, install, onLine) {
   try {
@@ -101,12 +709,45 @@ async function runtimeReady(host, settings, install, onLine) {
     return false;
   }
 }
+async function checkTtsModel(host, settings) {
+  try {
+    const result = await run(host, "tts-setup", [settings.modelDir, "check", settings.localTtsModel || "kokoro-en-v0_19"]);
+    return /"ttsModel":true/.test(result.stdout);
+  } catch {
+    return false;
+  }
+}
+async function installTtsModel(host, settings, progress) {
+  const runtime = await runtimeReady(host, settings, true, (line2) => {
+    if (line2.startsWith("progress ")) progress?.(line2.slice(9));
+  });
+  if (!runtime) throw new Error("Python speech runtime could not be installed.");
+  const result = await run(
+    host,
+    "tts-setup",
+    [settings.modelDir, "install", settings.localTtsModel || "kokoro-en-v0_19"],
+    "",
+    (line2) => {
+      if (line2.startsWith("progress ")) progress?.(line2.slice(9));
+    }
+  );
+  if (result.code !== 0) throw new Error(result.stderr.trim().split("\n").pop() || "TTS model install failed.");
+  return /"ttsModel":true/.test(result.stdout);
+}
 async function checkEngine(host, settings) {
-  const [result, runtime] = await Promise.all([
+  const [result, runtime, ttsModel] = await Promise.all([
     run(host, "setup", [settings.modelDir, "check", settings.whisper]),
-    runtimeReady(host, settings, false)
+    runtimeReady(host, settings, false),
+    checkTtsModel(host, settings)
   ]);
-  return parseStatus(result.stdout, runtime);
+  return parseStatus(result.stdout, runtime, ttsModel);
+}
+async function installRuntime(host, settings, progress) {
+  const ok = await runtimeReady(host, settings, true, (line2) => {
+    if (line2.startsWith("progress ")) progress?.(line2.slice(9));
+  });
+  if (!ok) throw new Error("Fast speech runtime could not be installed. Make sure python3 is available.");
+  return true;
 }
 async function installEngine(host, settings, progress) {
   const result = await run(host, "setup", [settings.modelDir, "install", settings.whisper], "", (line2) => {
@@ -116,9 +757,25 @@ async function installEngine(host, settings, progress) {
   const runtime = await runtimeReady(host, settings, true, (line2) => {
     if (line2.startsWith("progress ")) progress(line2.slice(9));
   });
-  return parseStatus(result.stdout, runtime);
+  const ttsModel = await checkTtsModel(host, settings);
+  return parseStatus(result.stdout, runtime, ttsModel);
 }
 async function transcribe(host, settings, wavBase64) {
+  if (settings.sttBackend === "openai" && settings.sttUrl.trim()) {
+    const base = settings.sttUrl.trim().replace(/\/+$/, "");
+    const url = /\/audio\/transcriptions$/.test(base) ? base : `${base}/audio/transcriptions`;
+    const result2 = await run(host, "stt-http", [url, settings.sttModel.trim() || "whisper-1", settings.sttKey.trim()], wavBase64);
+    if (result2.code !== 0) {
+      throw new Error(result2.stderr.trim().split("\n").pop() || `STT request failed (${result2.code}).`);
+    }
+    const raw = result2.stdout.trim();
+    try {
+      const parsed2 = JSON.parse(raw);
+      return String(parsed2.text ?? "").trim();
+    } catch {
+      return raw;
+    }
+  }
   const result = await run(host, "stt", [settings.modelDir, settings.whisper], wavBase64);
   const line2 = result.stdout.split("\n").filter((l) => l.startsWith("{")).pop();
   if (!line2) {
@@ -130,15 +787,46 @@ async function transcribe(host, settings, wavBase64) {
   if (parsed.error === "no-model") throw new Error("The whisper model is missing. Open Settings to install it.");
   return String(parsed.text ?? "").trim();
 }
+function chatUrl(settings) {
+  const base = settings.llmUrl.trim().replace(/\/+$/, "");
+  return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
+}
 function llmPoster(host, settings) {
   return async (body) => {
-    const base = settings.llmUrl.replace(/\/+$/, "");
-    const url = /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
+    const url = chatUrl(settings);
     const args = settings.llmKey ? ["-H", `Authorization: Bearer ${settings.llmKey}`, url] : [url];
     const result = await run(host, "llm", args, JSON.stringify(body));
     if (result.code !== 0) throw new Error(result.stderr.trim() || `The LLM call failed (${result.code}).`);
     return result.stdout;
   };
+}
+async function llmStream(host, settings, body, onDelta, signal) {
+  if (!host.spawn) throw new Error("This Buzz build cannot start local processes.");
+  if (signal?.aborted) throw new Error("Aborted");
+  const url = chatUrl(settings);
+  const args = ["-N", ...settings.llmKey ? ["-H", `Authorization: Bearer ${settings.llmKey}`] : [], url];
+  const parser = new SseParser(onDelta);
+  let stderr = "";
+  const process = await host.spawn("llm", {
+    args,
+    onStdout: (data) => parser.feed(data),
+    onStderr: (data) => {
+      stderr = (stderr + data).slice(-4e3);
+    }
+  });
+  const onAbort = () => {
+    void process.kill().catch(() => void 0);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    await process.end(JSON.stringify({ ...body, stream: true }));
+    const code = await process.exited;
+    if (signal?.aborted) throw new Error("Aborted");
+    if (code !== 0) throw new Error(stderr.trim() || `The LLM call failed (${code}).`);
+    return parser.finish();
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 var DECODE_CHUNK = TARGET_RATE * 10;
 function pcmBase64(samples) {
@@ -170,18 +858,44 @@ var Listener = class {
   get running() {
     return this.process !== null;
   }
-  async ensure(settings) {
-    const key = `${settings.modelDir}|${settings.whisper}`;
-    if (this.process && this.key === key) return true;
-    if (this.starting && this.key === key) return this.starting;
+  async ensure(settings, silenceSec = 0.6) {
+    const key = `${settings.modelDir}|${settings.sttBackend === "openai" ? "__none__" : settings.whisper}`;
+    if (this.process && this.key === key) {
+      this.configure(settings, silenceSec);
+      return true;
+    }
+    if (this.starting && this.key === key) {
+      const ok2 = await this.starting;
+      if (ok2) this.configure(settings, silenceSec);
+      return ok2;
+    }
     this.stop();
     this.key = key;
-    this.starting = this.launch(settings).finally(() => {
+    this.starting = this.launch(settings, silenceSec).finally(() => {
       this.starting = null;
     });
-    return this.starting;
+    const ok = await this.starting;
+    if (ok) this.configure(settings, silenceSec);
+    return ok;
   }
-  async launch(settings) {
+  configure(settings, silenceSec) {
+    if (!this.process) return;
+    const payload = JSON.stringify({
+      stt_mode: settings.sttBackend,
+      stt_url: settings.sttUrl.trim(),
+      stt_model: settings.sttModel.trim() || "whisper-1",
+      stt_key: settings.sttKey.trim(),
+      whisper: settings.whisper.trim() || "small.en",
+      silence: Math.max(0.15, Math.min(2, silenceSec))
+    });
+    void this.process.write(`c ${payload}
+`).catch(() => void 0);
+  }
+  setSilence(silenceSec) {
+    void this.process?.write(`s ${Math.max(0.15, Math.min(2, silenceSec)).toFixed(2)}
+`).catch(() => void 0);
+  }
+  async launch(settings, silenceSec) {
     if (!this.host.spawn) return false;
     const generation = ++this.generation;
     let partial = "";
@@ -191,8 +905,9 @@ var Listener = class {
       ready = resolve;
     });
     this.abandon = () => ready(false);
+    const whisperArg = settings.sttBackend === "openai" ? "__none__" : settings.whisper;
     const process = await this.host.spawn("listen", {
-      args: [settings.modelDir, settings.whisper, "0.6", listen_default],
+      args: [settings.modelDir, whisperArg, String(silenceSec), listen_default],
       onStdout: (data) => {
         partial += data;
         const lines = partial.split("\n");
@@ -225,6 +940,7 @@ var Listener = class {
       return;
     }
     if (parsed.ready) return ready(true);
+    if (parsed.configured) return;
     if (parsed.error === "no-runtime") return ready(false);
     if (typeof parsed.id === "string") {
       const waiter = this.waiting.get(parsed.id);
@@ -276,50 +992,251 @@ var Listener = class {
     void process?.kill().catch(() => void 0);
   }
 };
+var LocalTts = class {
+  constructor(host) {
+    this.host = host;
+  }
+  process = null;
+  starting = null;
+  key = "";
+  nextId = 1;
+  waiting = /* @__PURE__ */ new Map();
+  generation = 0;
+  abandon = () => {
+  };
+  speakers = 1;
+  sampleRate = 24e3;
+  async ensure(settings) {
+    const model = settings.localTtsModel.trim() || "kokoro-en-v0_19";
+    const key = `${settings.modelDir}|${model}`;
+    if (this.process && this.key === key) return true;
+    if (this.starting && this.key === key) return this.starting;
+    this.stop();
+    this.key = key;
+    this.starting = this.launch(settings.modelDir, model).finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
+  }
+  async launch(modelDir, model) {
+    if (!this.host.spawn) return false;
+    const generation = ++this.generation;
+    let partial = "";
+    let ready = () => {
+    };
+    const started = new Promise((resolve) => {
+      ready = resolve;
+    });
+    this.abandon = () => ready(false);
+    const process = await this.host.spawn("tts-local", {
+      args: [modelDir, model, tts_default],
+      onStdout: (data) => {
+        partial += data;
+        const lines = partial.split("\n");
+        partial = lines.pop() ?? "";
+        for (const line2 of lines) this.handleLine(line2, ready);
+      }
+    });
+    if (generation !== this.generation) {
+      void process.kill().catch(() => void 0);
+      return false;
+    }
+    this.process = process;
+    void process.exited.then(() => {
+      if (this.process !== process) return;
+      this.process = null;
+      ready(false);
+      this.fail();
+    });
+    const ok = await started;
+    if (!ok && this.process === process) this.stop();
+    return ok;
+  }
+  handleLine(line2, ready) {
+    if (!line2.startsWith("{")) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(line2);
+    } catch {
+      return;
+    }
+    if (parsed.ready) {
+      this.sampleRate = Number(parsed.rate) || 24e3;
+      this.speakers = Number(parsed.speakers) || 1;
+      return ready(true);
+    }
+    if (parsed.error && !parsed.id) return ready(false);
+    if (typeof parsed.id === "string") {
+      const waiter = this.waiting.get(parsed.id);
+      this.waiting.delete(parsed.id);
+      if (parsed.error) waiter?.reject(new Error(parsed.error));
+      else waiter?.resolve({ rate: Number(parsed.rate) || this.sampleRate, pcm: fromBase64(String(parsed.pcm ?? "")) });
+    }
+  }
+  async synthesize(text3, sid, speed) {
+    const process = this.process;
+    if (!process) throw new Error("Local TTS is not running.");
+    const id = String(this.nextId++);
+    const result = new Promise(
+      (resolve, reject) => this.waiting.set(id, { resolve, reject })
+    );
+    try {
+      await process.write(`${JSON.stringify({ id, text: text3, sid, speed })}
+`);
+    } catch (error) {
+      this.waiting.delete(id);
+      result.catch(() => void 0);
+      throw error;
+    }
+    return result;
+  }
+  fail() {
+    for (const waiter of this.waiting.values()) waiter.reject(new Error("Local TTS stopped."));
+    this.waiting.clear();
+  }
+  stop() {
+    const process = this.process;
+    this.process = null;
+    this.generation += 1;
+    this.abandon();
+    this.fail();
+    void process?.kill().catch(() => void 0);
+  }
+};
 var Speaker = class {
   constructor(host, settings) {
     this.host = host;
     this.settings = settings;
+    this.localTts = new LocalTts(host);
   }
-  current = null;
-  queue = Promise.resolve();
+  player = new AudioPlayer();
+  localTts;
+  activeAbort = new AbortController();
+  currentLegacy = null;
+  playChain = Promise.resolve();
   queued = 0;
   generation = 0;
   onIdle = () => {
   };
+  onStateChange = () => {
+  };
+  onError = () => {
+  };
   get speaking() {
-    return this.queued > 0;
+    return this.queued > 0 || this.player.playing;
+  }
+  setSharedAudioContext(getter) {
+    this.player.setSharedContext(getter);
+  }
+  cue(kind) {
+    if (this.settings().audioCues) this.player.cue(kind);
+  }
+  /** Pre-warms local sherpa-onnx TTS model in RAM if selected. */
+  async warm() {
+    const settings = this.settings();
+    if (settings.ttsBackend === "local") {
+      await this.localTts.ensure(settings).catch(() => void 0);
+    }
   }
   speak(text3, force = false) {
     const settings = this.settings();
     if (!settings.speak && !force) return;
     const clean2 = text3.replace(/^[\s-]+/, "").trim();
     if (!clean2) return;
+    const wasSpeaking = this.speaking;
     this.queued += 1;
+    if (!wasSpeaking) this.onStateChange(true);
     const generation = this.generation;
-    this.queue = this.queue.then(() => generation === this.generation ? this.say(clean2, settings) : void 0).catch(() => void 0).finally(() => {
+    const playerGen = this.player.currentGeneration;
+    const signal = this.activeAbort.signal;
+    const synthPromise = this.synthesize(clean2, settings, signal);
+    void synthPromise.catch(() => void 0);
+    this.playChain = this.playChain.then(async () => {
+      if (generation !== this.generation || signal.aborted) return;
+      const item = await synthPromise;
+      if (!item || generation !== this.generation || signal.aborted) return;
+      if (item.kind === "buffer") {
+        await this.player.playBuffer(item.buffer, playerGen);
+      } else {
+        await this.legacySay(item.text, settings, generation);
+      }
+    }).catch((error) => {
+      if (generation === this.generation && !signal.aborted) {
+        this.onError(error instanceof Error ? error.message : String(error));
+      }
+    }).finally(() => {
       if (generation === this.generation) this.done();
     });
   }
-  async say(text3, settings) {
+  async synthesize(text3, settings, signal) {
+    if (signal.aborted) return null;
+    const speed = Math.max(0.5, Math.min(2, Number(settings.ttsSpeed) || 1));
+    if (settings.ttsBackend === "openai" && settings.ttsUrl.trim()) {
+      const base = settings.ttsUrl.trim().replace(/\/+$/, "");
+      const url = /\/audio\/speech$/.test(base) ? base : `${base}/audio/speech`;
+      const payload = JSON.stringify({
+        model: settings.ttsModel.trim() || "kokoro",
+        input: text3,
+        voice: settings.ttsVoice.trim() || "af_heart",
+        response_format: "wav",
+        speed
+      });
+      const result = await run(this.host, "tts-http", [url, settings.ttsKey.trim()], payload, void 0, signal);
+      if (result.code !== 0) {
+        throw new Error(result.stderr.trim().split("\n").pop() || `TTS HTTP failed (${result.code}).`);
+      }
+      const bytes = fromBase64(result.stdout);
+      const buffer = await this.player.decodeBytes(bytes, 24e3);
+      return buffer ? { kind: "buffer", buffer } : null;
+    }
+    if (settings.ttsBackend === "local") {
+      const ok = await this.localTts.ensure(settings);
+      if (!ok) {
+        throw new Error("Local TTS model is not installed. Install it in Buzz Voice Settings.");
+      }
+      const audio = await this.localTts.synthesize(text3, Number(settings.localTtsSpeaker) || 0, speed);
+      if (signal.aborted) return null;
+      const buffer = await this.player.decodePcm16(audio.pcm, audio.rate);
+      return buffer ? { kind: "buffer", buffer } : null;
+    }
+    if (this.host.spawn) {
+      try {
+        const rateWpm = String(Math.round(190 * speed));
+        const attempts = settings.voice ? [[settings.voice, rateWpm], ["", rateWpm]] : [["", rateWpm]];
+        for (const args of attempts) {
+          if (signal.aborted) return null;
+          const result = await run(this.host, "tts-say", args, text3, void 0, signal);
+          if (result.code === 0 && result.stdout.trim()) {
+            const buffer = await this.player.decodeBytes(fromBase64(result.stdout), 24e3);
+            if (buffer) return { kind: "buffer", buffer };
+          }
+          if (result.code === 127) break;
+        }
+      } catch (err) {
+        if (signal.aborted) return null;
+      }
+    }
+    return { kind: "fallback", text: text3 };
+  }
+  async legacySay(text3, settings, generation) {
     if (this.host.spawn) {
       try {
         for (const args of settings.voice ? [["-v", settings.voice, text3], [text3]] : [[text3]]) {
-          const generation = this.generation;
-          this.current = await this.host.spawn("say", { args });
-          await this.current.end();
-          const code = await this.current.exited;
-          this.current = null;
-          if (code === 0 || generation !== this.generation) break;
+          if (generation !== this.generation) return;
+          this.currentLegacy = await this.host.spawn("say", { args });
+          await this.currentLegacy.end();
+          const code = await this.currentLegacy.exited;
+          this.currentLegacy = null;
+          if (code === 0 || generation !== this.generation) return;
         }
-        return;
       } catch {
-        this.current = null;
+        this.currentLegacy = null;
       }
     }
     if (typeof speechSynthesis === "undefined") return;
     await new Promise((resolve) => {
       const utterance = new SpeechSynthesisUtterance(text3);
+      utterance.rate = Math.max(0.5, Math.min(2, Number(settings.ttsSpeed) || 1));
       utterance.onend = () => resolve();
       utterance.onerror = () => resolve();
       speechSynthesis.speak(utterance);
@@ -328,17 +1245,31 @@ var Speaker = class {
   done() {
     if (this.queued === 0) return;
     this.queued -= 1;
-    if (this.queued === 0) this.onIdle();
+    if (this.queued === 0) {
+      this.onStateChange(false);
+      this.onIdle();
+    }
   }
   stop() {
-    const was = this.queued > 0;
+    const was = this.speaking;
     this.queued = 0;
     this.generation += 1;
-    this.queue = Promise.resolve();
-    void this.current?.kill();
-    this.current = null;
+    this.activeAbort.abort();
+    this.activeAbort = new AbortController();
+    this.playChain = Promise.resolve();
+    this.player.stop();
+    void this.currentLegacy?.kill().catch(() => void 0);
+    this.currentLegacy = null;
     if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
-    if (was) this.onIdle();
+    if (was) {
+      this.onStateChange(false);
+      this.onIdle();
+    }
+  }
+  dispose() {
+    this.stop();
+    this.localTts.stop();
+    this.player.close();
   }
 };
 var MAX_SECONDS = 120;
@@ -347,7 +1278,7 @@ var IDLE_RELEASE_MS = 10 * 6e4;
 var Recorder = class {
   stream = null;
   context = null;
-  node = null;
+  capture = null;
   opening = null;
   deviceId = "";
   capturing = false;
@@ -359,7 +1290,7 @@ var Recorder = class {
   onLevel = () => {
   };
   tap = null;
-  /** The microphone closed while hands-free was streaming from it. */
+  /** The microphone closed while hands-free or live mode was streaming from it. */
   onLost = () => {
   };
   tapped = [];
@@ -370,6 +1301,9 @@ var Recorder = class {
   }
   get open() {
     return this.stream !== null;
+  }
+  get audioContext() {
+    return this.context;
   }
   async warm(deviceId) {
     if (this.stream && this.deviceId === deviceId) {
@@ -401,9 +1335,7 @@ var Recorder = class {
     const Context = window.AudioContext ?? window.webkitAudioContext;
     const context = new Context();
     const source = context.createMediaStreamSource(stream);
-    const node2 = context.createScriptProcessor(2048, 1, 1);
-    node2.onaudioprocess = (event) => {
-      const input = new Float32Array(event.inputBuffer.getChannelData(0));
+    const capture = await attachCapture(context, source, (input) => {
       if (this.tap) this.feedTap(resample(input, context.sampleRate, TARGET_RATE));
       if (this.capturing) {
         if (this.samples < context.sampleRate * MAX_SECONDS) {
@@ -411,7 +1343,7 @@ var Recorder = class {
           this.samples += input.length;
         }
         let peak = 0;
-        for (let i = 0; i < input.length; i += 16) peak = Math.max(peak, Math.abs(input[i]));
+        for (let i = 0; i < input.length; i += 8) peak = Math.max(peak, Math.abs(input[i]));
         this.level = peak;
         this.onLevel(peak);
       } else {
@@ -421,12 +1353,16 @@ var Recorder = class {
           this.prerollSamples -= this.preroll.shift().length;
         }
       }
-    };
-    source.connect(node2);
-    node2.connect(context.destination);
+    });
+    if (this.deviceId !== deviceId) {
+      capture.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      void context.close().catch(() => void 0);
+      return;
+    }
     this.stream = stream;
     this.context = context;
-    this.node = node2;
+    this.capture = capture;
     if (context.state === "suspended") await context.resume();
     stream.getTracks().forEach(
       (track) => track.addEventListener("ended", () => {
@@ -438,9 +1374,10 @@ var Recorder = class {
     );
     this.armIdle();
   }
-  /** Streams 16 kHz audio in 100 ms frames while set, and keeps the microphone open. */
-  async listen(tap, deviceId = "") {
+  /** Streams 16 kHz audio in low-latency 32 ms frames while set, and keeps the microphone open. */
+  async listen(tap, deviceId = "", onLevel) {
     this.tap = tap;
+    if (onLevel) this.onLevel = onLevel;
     this.tapped = [];
     this.tappedSamples = 0;
     if (tap) await this.warm(deviceId);
@@ -459,8 +1396,9 @@ var Recorder = class {
     this.tapped = [];
     this.tappedSamples = 0;
     let peak = 0;
-    for (let i = 0; i < frame.length; i += 16) peak = Math.max(peak, Math.abs(frame[i]));
+    for (let i = 0; i < frame.length; i += 8) peak = Math.max(peak, Math.abs(frame[i]));
     this.level = peak;
+    if (!this.capturing) this.onLevel(peak);
     this.tap?.(frame);
   }
   armIdle() {
@@ -513,12 +1451,12 @@ var Recorder = class {
     this.idleTimer = null;
     this.capturing = false;
     this.tap = null;
-    this.node?.disconnect();
+    this.capture?.disconnect();
     this.stream?.getTracks().forEach((track) => track.stop());
     void this.context?.close().catch(() => void 0);
     this.stream = null;
     this.context = null;
-    this.node = null;
+    this.capture = null;
     this.chunks = [];
     this.preroll = [];
     this.prerollSamples = 0;
@@ -574,6 +1512,342 @@ function toBase64(bytes) {
     binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
   }
   return btoa(binary);
+}
+
+// src/agent.ts
+var AGENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "list_channels",
+      description: "List available Buzz channels and their descriptions.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_channel",
+      description: "Read the most recent threads in a Buzz channel and bring that channel into focus.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (exact or approximate)." },
+          limit: { type: "integer", description: "Number of recent threads to inspect (default 8, max 15)." }
+        },
+        required: ["channel"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_thread",
+      description: "Read the full messages of a specific thread in focus, by thread number, or by topic hint.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (optional if already in focus)." },
+          thread_ref: { type: "integer", description: "1-based thread number from the current scope." },
+          thread_hint: { type: "string", description: "Short topic description if referring to a thread by subject." }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "check_inbox",
+      description: "Check unread @mentions and notifications waiting on the owner across all channels.",
+      parameters: {
+        type: "object",
+        properties: {
+          days: { type: "integer", description: "How many days back to check (default 3)." }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_todos",
+      description: "Read the Canvas todo list for a channel.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (optional if already in focus)." }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "draft_message",
+      description: "Draft (or update the current draft of) a Buzz message or task assignment. Depending on user settings this opens a confirmation card or sends immediately.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Target channel name (optional if continuing current focus)." },
+          message: {
+            type: "string",
+            description: "Direct message body without routing wrappers like 'tell X to'. Keep domain terms, hostnames, repos, and branch names verbatim."
+          },
+          recipient: { type: "string", description: "Person or agent to @mention (optional)." },
+          thread_ref: { type: "integer", description: "1-based thread number in current scope to reply in." },
+          thread_hint: { type: "string", description: "Topic description of an existing thread to reply in." },
+          new_thread: { type: "boolean", description: "True only when explicitly starting a brand new top-level thread." }
+        },
+        required: ["message"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_draft",
+      description: "Send or save the currently pending message or todo draft after the user confirms.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "cancel_draft",
+      description: "Cancel and discard the currently pending message or todo draft.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_todo",
+      description: "Add, assign, start, finish, or reopen a todo item on a channel's Canvas todo list.",
+      parameters: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Channel name (optional if already in focus)." },
+          op: { type: "string", enum: ["add", "start", "done", "reopen", "assign"] },
+          label: { type: "string", description: "Todo text (for add) or phrase matching an existing todo." },
+          assignee: { type: "string", description: "Person or agent to assign (optional, required for op=assign)." },
+          thread_hint: { type: "string", description: "Optional thread topic to post the assignment notification in." }
+        },
+        required: ["op", "label"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "tracked_status",
+      description: "Check the status reactions (working, stalled, done, needs-input) on recently tracked threads.",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", enum: ["all", "working", "stalled", "done", "needs-input"] }
+        },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "flag_thread",
+      description: "Add an emoji reaction flag (e.g. \u{1F440}, \u{1F504}, \u2705, \u26D4) to the focused or referenced thread.",
+      parameters: {
+        type: "object",
+        properties: {
+          emoji: { type: "string", description: "Emoji to react with." },
+          channel: { type: "string", description: "Channel name (optional if in focus)." },
+          thread_ref: { type: "integer", description: "1-based thread number in current scope (optional)." }
+        },
+        required: ["emoji"],
+        additionalProperties: false
+      }
+    }
+  }
+];
+function buildSystemPrompt(ctx) {
+  const channelsList = ctx.channels.slice(0, 80).map((c) => `- ${c.name}${c.description ? `: ${c.description.replace(/\s+/g, " ").slice(0, 120)}` : ""}`).join("\n");
+  return [
+    "You are Buzz Voice, a fast, reactive spoken voice collaborator inside Buzz.",
+    "Speak naturally and concisely in plain English: 1 to 3 short sentences, under 45 words unless asked for more detail.",
+    "Never use markdown, bullet lists, code blocks, raw URLs, or event IDs in your spoken replies.",
+    "When you need to read from Buzz (channels, threads, inbox, todos), say a tiny 2 to 5 word spoken acknowledgement first (like 'Checking ops.' or 'Looking at your inbox.') alongside the tool call so the user hears instant feedback.",
+    "Never guess or invent channel messages, agent replies, or todos\u2014always call the tool first.",
+    "Speech recognition often mangles channel and agent names (numbers as words, spelled-out letters); match them by sound to the lists below.",
+    "Preserve domain terms (hostnames, repo names, branches, agent names) verbatim when drafting messages.",
+    ctx.confirmBeforeSend ? "Confirm-before-send is ON: draft_message and manage_todo stage a draft for the user to approve. Read back a brief 1-sentence confirmation and wait for them to say yes, edit it, or cancel." : "Confirm-before-send is OFF: draft_message and manage_todo execute immediately. Confirm briefly once done.",
+    "",
+    "Channels:",
+    channelsList || "(none loaded yet)",
+    ...ctx.people.length ? ["", `Known people/agents: ${ctx.people.slice(0, 120).join(", ")}`] : [],
+    ...ctx.scopeSummary ? ["", `Current focus:
+${ctx.scopeSummary}`] : [],
+    ...ctx.pendingSummary ? ["", `Active pending draft:
+${ctx.pendingSummary}`] : [],
+    ...ctx.watchesSummary ? ["", `Watched threads:
+${ctx.watchesSummary}`] : []
+  ].join("\n");
+}
+function parseArgs(raw) {
+  if (!raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+var MAX_STEPS = 5;
+async function runAgentTurn(opts) {
+  const added = [];
+  const sentences = new SentenceBuffer();
+  let allSpoken = "";
+  const emitSentence = (sentence) => {
+    if (opts.signal.aborted) return;
+    opts.onSpeak(sentence);
+  };
+  for (let step = 0; step < MAX_STEPS; step += 1) {
+    if (opts.signal.aborted) {
+      return { spoken: allSpoken, aborted: true, newMessages: added };
+    }
+    const system = buildSystemPrompt(opts.context());
+    const messages = [{ role: "system", content: system }, ...opts.history, ...added];
+    let stepText = "";
+    const body = {
+      model: opts.settings.llmModel || "default",
+      messages,
+      tools: AGENT_TOOLS,
+      tool_choice: "auto",
+      max_tokens: 420,
+      chat_template_kwargs: { enable_thinking: false }
+    };
+    let result;
+    try {
+      result = await llmStream(
+        opts.host,
+        opts.settings,
+        body,
+        (delta) => {
+          if (opts.signal.aborted) return;
+          stepText += delta;
+          const combined = allSpoken ? `${allSpoken}
+${stepText}` : stepText;
+          opts.onTextUpdate(combined.trim());
+          sentences.push(delta, emitSentence);
+        },
+        opts.signal
+      );
+    } catch (error) {
+      if (opts.signal.aborted) {
+        return { spoken: (allSpoken ? `${allSpoken} ${stepText}` : stepText).trim(), aborted: true, newMessages: added };
+      }
+      if (step === 0 && /chat_template_kwargs|unknown|extra_forbidden|unrecognized/i.test(String(error))) {
+        delete body.chat_template_kwargs;
+        stepText = "";
+        sentences.reset();
+        result = await llmStream(
+          opts.host,
+          opts.settings,
+          body,
+          (delta) => {
+            if (opts.signal.aborted) return;
+            stepText += delta;
+            const combined = allSpoken ? `${allSpoken}
+${stepText}` : stepText;
+            opts.onTextUpdate(combined.trim());
+            sentences.push(delta, emitSentence);
+          },
+          opts.signal
+        );
+      } else {
+        throw error;
+      }
+    }
+    sentences.flush(emitSentence);
+    sentences.reset();
+    if (opts.signal.aborted) {
+      return { spoken: (allSpoken ? `${allSpoken} ${stepText}` : stepText).trim(), aborted: true, newMessages: added };
+    }
+    const finalText = (result.content || stepText).trim();
+    if (finalText) {
+      allSpoken = allSpoken ? `${allSpoken}
+${finalText}` : finalText;
+      opts.onTextUpdate(allSpoken);
+    }
+    const toolCalls = result.toolCalls;
+    if (toolCalls.length === 0) {
+      if (finalText) added.push({ role: "assistant", content: finalText });
+      return { spoken: allSpoken, aborted: false, newMessages: added };
+    }
+    added.push({
+      role: "assistant",
+      content: finalText,
+      tool_calls: toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments || "{}" }
+      }))
+    });
+    const toolLabels = toolCalls.map((tc) => friendlyToolLabel(tc.name, parseArgs(tc.arguments)));
+    opts.onActivity(toolLabels[0] || "Checking Buzz...");
+    const outputs = await Promise.all(
+      toolCalls.map(async (tc) => {
+        if (opts.signal.aborted) return { id: tc.id, content: "Aborted." };
+        try {
+          const out = await opts.executeTool(tc.name, parseArgs(tc.arguments));
+          return { id: tc.id, content: out.result };
+        } catch (err) {
+          return { id: tc.id, content: `Error: ${err instanceof Error ? err.message : String(err)}` };
+        }
+      })
+    );
+    if (opts.signal.aborted) {
+      return { spoken: allSpoken, aborted: true, newMessages: added };
+    }
+    for (const output of outputs) {
+      added.push({ role: "tool", tool_call_id: output.id, content: output.content });
+    }
+    opts.onActivity("Thinking...");
+  }
+  return { spoken: allSpoken, aborted: false, newMessages: added };
+}
+function friendlyToolLabel(name, args) {
+  const ch = typeof args.channel === "string" && args.channel ? `#${args.channel}` : "";
+  switch (name) {
+    case "list_channels":
+      return "Listing channels...";
+    case "read_channel":
+      return ch ? `Reading ${ch}...` : "Reading channel...";
+    case "read_thread":
+      return ch ? `Reading thread in ${ch}...` : "Reading thread...";
+    case "check_inbox":
+      return "Checking inbox...";
+    case "list_todos":
+      return ch ? `Reading ${ch} todos...` : "Reading todos...";
+    case "draft_message":
+      return ch ? `Drafting for ${ch}...` : "Drafting message...";
+    case "send_draft":
+      return "Sending...";
+    case "cancel_draft":
+      return "Cancelling draft...";
+    case "manage_todo":
+      return ch ? `Updating ${ch} todos...` : "Updating todos...";
+    case "tracked_status":
+      return "Checking tracked work...";
+    case "flag_thread":
+      return "Flagging thread...";
+    default:
+      return "Working...";
+  }
 }
 
 // src/match.ts
@@ -1357,7 +2631,7 @@ async function summarize(llm, preamble, question, blocks) {
   return { answer: answer.replace(/\s+/g, " ").trim(), thread };
 }
 
-// node_modules/mdast-util-to-string/lib/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/mdast-util-to-string/lib/index.js
 var emptyOptions = {};
 function toString(value, options) {
   const settings = options || emptyOptions;
@@ -1394,7 +2668,7 @@ function node(value) {
   return Boolean(value && typeof value === "object");
 }
 
-// node_modules/decode-named-character-reference/index.dom.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/decode-named-character-reference/index.dom.js
 var element = document.createElement("i");
 function decodeNamedCharacterReference(value) {
   const characterReference2 = "&" + value + ";";
@@ -1406,7 +2680,7 @@ function decodeNamedCharacterReference(value) {
   return character === characterReference2 ? false : character;
 }
 
-// node_modules/micromark-util-chunked/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-chunked/index.js
 function splice(list2, start, remove, items) {
   const end = list2.length;
   let chunkStart = 0;
@@ -1440,7 +2714,7 @@ function push(list2, items) {
   return items;
 }
 
-// node_modules/micromark-util-combine-extensions/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-combine-extensions/index.js
 var hasOwnProperty = {}.hasOwnProperty;
 function combineExtensions(extensions) {
   const all2 = {};
@@ -1480,7 +2754,7 @@ function constructs(existing, list2) {
   splice(existing, 0, 0, before);
 }
 
-// node_modules/micromark-util-decode-numeric-character-reference/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-decode-numeric-character-reference/index.js
 function decodeNumericCharacterReference(value, base) {
   const code = Number.parseInt(value, base);
   if (
@@ -1498,12 +2772,12 @@ function decodeNumericCharacterReference(value, base) {
   return String.fromCodePoint(code);
 }
 
-// node_modules/micromark-util-normalize-identifier/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-normalize-identifier/index.js
 function normalizeIdentifier(value) {
   return value.replace(/[\t\n\r ]+/g, " ").replace(/^ | $/g, "").toLowerCase().toUpperCase();
 }
 
-// node_modules/micromark-util-character/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-character/index.js
 var asciiAlpha = regexCheck(/[A-Za-z]/);
 var asciiAlphanumeric = regexCheck(/[\dA-Za-z]/);
 var asciiAtext = regexCheck(/[#-'*+\--9=?A-Z^-~]/);
@@ -1535,7 +2809,7 @@ function regexCheck(regex) {
   }
 }
 
-// node_modules/micromark-factory-space/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-factory-space/index.js
 function factorySpace(effects, ok, type, max) {
   const limit = max ? max - 1 : Infinity;
   let size = 0;
@@ -1580,7 +2854,7 @@ function factorySpaceMinMax(effects, ok, nok, type, min, max) {
   }
 }
 
-// node_modules/micromark/lib/initialize/content.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/initialize/content.js
 var content = {
   tokenize: initializeContent
 };
@@ -1630,7 +2904,7 @@ function initializeContent(effects) {
   }
 }
 
-// node_modules/micromark-util-edit-map/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-edit-map/index.js
 var EditMap = class {
   /**
    * Create a new edit map.
@@ -1728,7 +3002,7 @@ function addImplementation(editMap, at, remove, add, before) {
   editMap.index.set(at, change);
 }
 
-// node_modules/micromark/lib/initialize/document.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/initialize/document.js
 var document2 = {
   tokenize: initializeDocument
 };
@@ -1922,7 +3196,7 @@ function tokenizeContainer(effects, ok, nok) {
   return factorySpace(effects, effects.attempt(this.parser.constructs.document, ok, nok), "linePrefix", this.parser.constructs.disable.null.includes("codeIndented") ? void 0 : 4);
 }
 
-// node_modules/micromark-util-classify-character/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-classify-character/index.js
 function classifyCharacter(code) {
   if (code === null || markdownLineEndingOrSpace(code) || unicodeWhitespace(code)) {
     return 1;
@@ -1932,7 +3206,7 @@ function classifyCharacter(code) {
   }
 }
 
-// node_modules/micromark-util-resolve-all/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-resolve-all/index.js
 function resolveAll(constructs2, events, context) {
   const called = [];
   let index2 = -1;
@@ -1946,7 +3220,7 @@ function resolveAll(constructs2, events, context) {
   return events;
 }
 
-// node_modules/micromark-core-commonmark/lib/attention.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/attention.js
 var attention = {
   name: "attention",
   resolveAll: resolveAllAttention,
@@ -2069,7 +3343,7 @@ function movePoint(point3, offset) {
   point3._bufferIndex += offset;
 }
 
-// node_modules/micromark-core-commonmark/lib/autolink.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/autolink.js
 var autolink = {
   name: "autolink",
   tokenize: tokenizeAutolink
@@ -2170,7 +3444,7 @@ function tokenizeAutolink(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/blank-line.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/blank-line.js
 var blankLine = {
   partial: true,
   tokenize: tokenizeBlankLine
@@ -2185,7 +3459,7 @@ function tokenizeBlankLine(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/block-quote.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/block-quote.js
 var blockQuote = {
   continuation: {
     tokenize: tokenizeBlockQuoteContinuation
@@ -2243,7 +3517,7 @@ function exit(effects) {
   effects.exit("blockQuote");
 }
 
-// node_modules/micromark-core-commonmark/lib/character-escape.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/character-escape.js
 var characterEscape = {
   name: "characterEscape",
   tokenize: tokenizeCharacterEscape
@@ -2269,7 +3543,7 @@ function tokenizeCharacterEscape(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/character-reference.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/character-reference.js
 var characterReference = {
   name: "characterReference",
   tokenize: tokenizeCharacterReference
@@ -2334,7 +3608,7 @@ function tokenizeCharacterReference(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/partial-non-lazy-continuation.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/partial-non-lazy-continuation.js
 var nonLazyContinuation = {
   partial: true,
   tokenize: tokenizeNonLazyContinuation
@@ -2356,7 +3630,7 @@ function tokenizeNonLazyContinuation(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/code-fenced.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/code-fenced.js
 var codeFenced = {
   concrete: true,
   name: "codeFenced",
@@ -2519,7 +3793,7 @@ function tokenizeCodeFenced(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/code-indented.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/code-indented.js
 var codeIndented = {
   name: "codeIndented",
   tokenize: tokenizeCodeIndented
@@ -2577,7 +3851,7 @@ function tokenizeFurtherStart(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/code-text.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/code-text.js
 var codeText = {
   name: "codeText",
   previous,
@@ -2692,7 +3966,7 @@ function tokenizeCodeText(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-util-subtokenize/lib/splice-buffer.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-subtokenize/lib/splice-buffer.js
 var SpliceBuffer = class {
   /**
    * @param {ReadonlyArray<T> | null | undefined} [initial]
@@ -2885,7 +4159,7 @@ function chunkedPush(list2, right) {
   }
 }
 
-// node_modules/micromark-util-subtokenize/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-subtokenize/index.js
 function subtokenize(eventsArray) {
   const jumps = {};
   let index2 = -1;
@@ -3038,7 +4312,7 @@ function subcontent(events, eventIndex) {
   return gaps;
 }
 
-// node_modules/micromark-core-commonmark/lib/content.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/content.js
 var content2 = {
   resolve: resolveContent,
   tokenize: tokenizeContent
@@ -3109,7 +4383,7 @@ function tokenizeContinuation(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-factory-destination/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-factory-destination/index.js
 function factoryDestination(effects, ok, nok, type, literalType, literalMarkerType, rawType, stringType, max) {
   const limit = max || Number.POSITIVE_INFINITY;
   let balance = 0;
@@ -3201,7 +4475,7 @@ function factoryDestination(effects, ok, nok, type, literalType, literalMarkerTy
   }
 }
 
-// node_modules/micromark-factory-label/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-factory-label/index.js
 function factoryLabel(effects, ok, nok, type, markerType, stringType) {
   const self = this;
   let size = 0;
@@ -3262,7 +4536,7 @@ function factoryLabel(effects, ok, nok, type, markerType, stringType) {
   }
 }
 
-// node_modules/micromark-factory-title/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-factory-title/index.js
 function factoryTitle(effects, ok, nok, type, markerType, stringType) {
   let marker;
   return start;
@@ -3324,7 +4598,7 @@ function factoryTitle(effects, ok, nok, type, markerType, stringType) {
   }
 }
 
-// node_modules/micromark-factory-whitespace/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-factory-whitespace/index.js
 function factoryWhitespace(effects, ok) {
   let seen;
   return start;
@@ -3343,7 +4617,7 @@ function factoryWhitespace(effects, ok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/definition.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/definition.js
 var definition = {
   name: "definition",
   tokenize: tokenizeDefinition
@@ -3429,7 +4703,7 @@ function tokenizeTitleBefore(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/hard-break-escape.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/hard-break-escape.js
 var hardBreakEscape = {
   name: "hardBreakEscape",
   tokenize: tokenizeHardBreakEscape
@@ -3450,7 +4724,7 @@ function tokenizeHardBreakEscape(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/heading-atx.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/heading-atx.js
 var headingAtx = {
   name: "headingAtx",
   resolve: resolveHeadingAtx,
@@ -3539,7 +4813,7 @@ function tokenizeHeadingAtx(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-util-html-tag-name/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-html-tag-name/index.js
 var htmlBlockNames = [
   "address",
   "article",
@@ -3606,7 +4880,7 @@ var htmlBlockNames = [
 ];
 var htmlRawNames = ["pre", "script", "style", "textarea"];
 
-// node_modules/micromark-core-commonmark/lib/html-flow.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/html-flow.js
 var htmlFlow = {
   concrete: true,
   name: "htmlFlow",
@@ -3965,7 +5239,7 @@ function tokenizeBlankLineBefore(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/html-text.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/html-text.js
 var htmlText = {
   name: "htmlText",
   tokenize: tokenizeHtmlText
@@ -4271,7 +5545,7 @@ function tokenizeHtmlText(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/label-end.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/label-end.js
 var labelEnd = {
   name: "labelEnd",
   resolveAll: resolveAllLabelEnd,
@@ -4497,7 +5771,7 @@ function tokenizeReferenceCollapsed(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/label-start-image.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/label-start-image.js
 var labelStartImage = {
   name: "labelStartImage",
   resolveAll: labelEnd.resolveAll,
@@ -4534,7 +5808,7 @@ function tokenizeLabelStartImage(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/label-start-link.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/label-start-link.js
 var labelStartLink = {
   name: "labelStartLink",
   resolveAll: labelEnd.resolveAll,
@@ -4562,7 +5836,7 @@ function tokenizeLabelStartLink(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/line-ending.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/line-ending.js
 var lineEnding = {
   name: "lineEnding",
   tokenize: tokenizeLineEnding
@@ -4577,7 +5851,7 @@ function tokenizeLineEnding(effects, ok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/thematic-break.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/thematic-break.js
 var thematicBreak = {
   name: "thematicBreak",
   tokenize: tokenizeThematicBreak
@@ -4616,7 +5890,7 @@ function tokenizeThematicBreak(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/list.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/list.js
 var list = {
   continuation: {
     tokenize: tokenizeListContinuation
@@ -4746,7 +6020,7 @@ function tokenizeListItemPrefixWhitespace(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark-core-commonmark/lib/setext-underline.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-core-commonmark/lib/setext-underline.js
 var setextUnderline = {
   name: "setextUnderline",
   resolveTo: resolveToSetextUnderline,
@@ -4840,7 +6114,7 @@ function tokenizeSetextUnderline(effects, ok, nok) {
   }
 }
 
-// node_modules/micromark/lib/initialize/flow.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/initialize/flow.js
 var flow = {
   tokenize: initializeFlow
 };
@@ -4878,7 +6152,7 @@ function initializeFlow(effects) {
   }
 }
 
-// node_modules/micromark/lib/initialize/text.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/initialize/text.js
 var resolver = {
   resolveAll: createResolver()
 };
@@ -5020,7 +6294,7 @@ function resolveAllLineSuffixes(events, context) {
   return events;
 }
 
-// node_modules/micromark/lib/constructs.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/constructs.js
 var constructs_exports = {};
 __export(constructs_exports, {
   attentionMarkers: () => attentionMarkers,
@@ -5095,7 +6369,7 @@ var disable = {
   null: []
 };
 
-// node_modules/micromark/lib/create-tokenizer.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/create-tokenizer.js
 function createTokenizer(parser, initialize, from) {
   let point3 = {
     _bufferIndex: -1,
@@ -5421,7 +6695,7 @@ function serializeChunks(chunks, expandTabs) {
   return result.join("");
 }
 
-// node_modules/micromark/lib/parse.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/parse.js
 function parse(options) {
   const settings = options || {};
   const constructs2 = (
@@ -5447,14 +6721,14 @@ function parse(options) {
   }
 }
 
-// node_modules/micromark/lib/postprocess.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/postprocess.js
 function postprocess(events) {
   while (!subtokenize(events)) {
   }
   return events;
 }
 
-// node_modules/micromark/lib/preprocess.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark/lib/preprocess.js
 var search = /[\0\t\n\r]/g;
 function preprocess() {
   let column = 1;
@@ -5534,7 +6808,7 @@ function preprocess() {
   }
 }
 
-// node_modules/micromark-util-decode-string/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/micromark-util-decode-string/index.js
 var characterEscapeOrReference = /\\([!-/:-@[-`{-~])|&(#(?:\d{1,7}|x[\da-f]{1,6})|[\da-z]{1,31});/gi;
 function decodeString(value) {
   return value.replace(characterEscapeOrReference, decode);
@@ -5552,7 +6826,7 @@ function decode($0, $1, $2) {
   return decodeNamedCharacterReference($2) || $0;
 }
 
-// node_modules/unist-util-stringify-position/lib/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/unist-util-stringify-position/lib/index.js
 function stringifyPosition(value) {
   if (!value || typeof value !== "object") {
     return "";
@@ -5578,7 +6852,7 @@ function index(value) {
   return value && typeof value === "number" ? value : 1;
 }
 
-// node_modules/mdast-util-from-markdown/lib/index.js
+// ../../../.buzz-www21-opus/REPOS/buzz-voice-plugin/node_modules/mdast-util-from-markdown/lib/index.js
 var own = {}.hasOwnProperty;
 function fromMarkdown(value, encoding, options) {
   if (encoding && typeof encoding === "object") {
@@ -6593,14 +7867,16 @@ function scopeLabel(scope) {
 
 // src/controller.ts
 var HISTORY_TURNS = 12;
+var AGENT_HISTORY_MAX = 24;
 var INBOX_DAYS = 3;
 var WATCH_HOURS = 8;
 var MAX_WATCHES = 12;
-var POLL_MS = 15e3;
+var FALLBACK_POLL_MS = 45e3;
 var MAX_LOG = 200;
 var WATCH_KEY = "buzz-voice-plugin.watches";
 var TRACK_KEY = "buzz-voice-plugin.threads";
 var FOLLOW_UP_MS = 12e3;
+var BARGE_IN_CONFIRM_MS = 180;
 var YES = /\b(yes|yep|yeah|send it|do it|go ahead|confirm|sure)\b/i;
 var NO = /\b(no|nope|cancel|stop|never ?mind|don'?t)\b/i;
 var NOISE = /^\W*(?:thank you|thanks|you|bye|okay|ok|uh|um|hmm|mm|oh|so|yeah)\W*$/i;
@@ -6640,18 +7916,30 @@ var Controller = class {
   constructor(deps) {
     this.deps = deps;
     this.speaker = new Speaker(deps.host, () => this.state.settings);
+    this.speaker.setSharedAudioContext(() => this.recorder.audioContext);
+    this.speaker.onStateChange = (speaking) => {
+      this.set({ speaking });
+      this.syncActivity();
+    };
+    this.speaker.onError = (err) => {
+      this.setStatus(`Speech output: ${err}`, true);
+    };
+    this.speaker.onIdle = () => {
+      this.syncActivity();
+      if (this.state.handsFree && !this.state.liveMode) {
+        if (!this.state.settings.bargeIn) this.listener.reset();
+        this.wake(FOLLOW_UP_MS);
+      }
+    };
     this.listener = new Listener(deps.host);
     this.listener.onHeard = (heard) => this.heard(heard);
     this.listener.onExit = () => {
-      if (this.wantHandsFree) void this.dropHandsFree("Speech recognition stopped. Turn hands-free on to restart it.");
+      if (this.wantLiveMode) void this.dropLive("Speech recognition stopped. Turn Live on to restart it.");
+      else if (this.wantHandsFree) void this.dropHandsFree("Speech recognition stopped. Turn hands-free on to restart it.");
     };
     this.recorder.onLost = () => {
-      if (this.wantHandsFree) void this.dropHandsFree("The microphone disconnected.");
-    };
-    this.speaker.onIdle = () => {
-      if (!this.state.handsFree) return;
-      this.listener.reset();
-      this.wake(FOLLOW_UP_MS);
+      if (this.wantLiveMode) void this.dropLive("The microphone disconnected.");
+      else if (this.wantHandsFree) void this.dropHandsFree("The microphone disconnected.");
     };
     const watches = loadJson(WATCH_KEY, []).filter((w) => w.until > now());
     this.state = {
@@ -6661,6 +7949,9 @@ var Controller = class {
       latched: false,
       transcribing: false,
       busy: false,
+      speaking: false,
+      activity: "idle",
+      activityDetail: "",
       level: 0,
       status: "",
       statusBad: false,
@@ -6673,9 +7964,11 @@ var Controller = class {
       installing: "",
       settings: loadSettings(),
       routing: "",
+      liveMode: false,
       handsFree: false,
       hearing: false,
-      awake: false
+      awake: false,
+      huddlePaused: false
     };
   }
   state;
@@ -6684,7 +7977,9 @@ var Controller = class {
   speaker;
   scope = emptyScope();
   history = [];
+  agentHistory = [];
   turn = 0;
+  activeAbort = null;
   nextId = 1;
   awaitingYesNo = false;
   tracked = loadJson(TRACK_KEY, []);
@@ -6695,6 +7990,17 @@ var Controller = class {
   listener;
   awakeUntil = 0;
   wantHandsFree = false;
+  wantLiveMode = false;
+  pausedMode = null;
+  bargeInTimer = null;
+  // Reactive relay caches & live watch observer
+  peopleCache = [];
+  peopleCacheAt = 0;
+  observedRelay = null;
+  relayUnsubs = [];
+  watchObserver = null;
+  watchKey = "";
+  seenReplyIds = /* @__PURE__ */ new Set();
   subscribe = (listener) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -6704,54 +8010,302 @@ var Controller = class {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
   }
+  syncActivity(detail) {
+    const s = this.state;
+    let activity = "idle";
+    if (s.listening || s.hearing) activity = s.hearing ? "hearing" : "listening";
+    else if (s.transcribing) activity = "transcribing";
+    else if (s.speaking) activity = "speaking";
+    else if (s.busy) activity = "thinking";
+    else if (s.liveMode || s.handsFree) activity = "listening";
+    const nextDetail = detail !== void 0 ? detail : activity === "thinking" ? s.activityDetail : "";
+    if (s.activity !== activity || s.activityDetail !== nextDetail) {
+      this.set({ activity, activityDetail: nextDetail });
+    }
+  }
   start() {
-    this.timer = setInterval(() => void this.tick(), POLL_MS);
+    this.timer = setInterval(() => {
+      this.ensureRelayBindings();
+      void this.tick();
+    }, FALLBACK_POLL_MS);
+    this.ensureRelayBindings();
     void this.refreshEngine().then(() => {
       if (this.state.settings.handsFree) void this.setHandsFree(true);
     });
     return () => {
       if (this.timer) clearInterval(this.timer);
       this.timer = null;
+      this.clearBargeInTimer();
+      this.abortTurn();
+      this.teardownRelayBindings();
       this.recorder.release();
       this.listener.stop();
-      this.speaker.stop();
+      this.speaker.dispose();
     };
+  }
+  /** Called from index.ts whenever Buzz relay connection changes. */
+  onRelayChanged() {
+    this.ensureRelayBindings();
+  }
+  /** Auto-pauses Live/Hands-free while the user is in a native Buzz Huddle. */
+  setHuddleActive(active) {
+    if (active) {
+      if (this.wantLiveMode) {
+        this.pausedMode = "live";
+        void this.setLiveMode(false);
+        this.set({ huddlePaused: true, status: "Paused while in a Huddle." });
+      } else if (this.wantHandsFree) {
+        this.pausedMode = "handsFree";
+        void this.setHandsFree(false, false);
+        this.set({ huddlePaused: true, status: "Paused while in a Huddle." });
+      }
+      return;
+    }
+    const resume = this.pausedMode;
+    this.pausedMode = null;
+    if (this.state.huddlePaused) this.set({ huddlePaused: false });
+    if (resume === "live") void this.setLiveMode(true);
+    else if (resume === "handsFree") void this.setHandsFree(true, false);
+  }
+  ensureRelayBindings() {
+    const relay = this.deps.relay();
+    if (relay === this.observedRelay) {
+      this.syncWatchObserver();
+      return;
+    }
+    this.teardownRelayBindings();
+    this.observedRelay = relay;
+    if (!relay) return;
+    this.peopleCache = [];
+    this.peopleCacheAt = 0;
+    const bumpPeople = () => {
+      void this.refreshPeopleCache(relay);
+    };
+    this.relayUnsubs.push(relay.session.channels.subscribeList(bumpPeople));
+    this.relayUnsubs.push(relay.session.profiles.subscribe(() => this.rebuildPeopleFromSnapshot(relay)));
+    void this.refreshPeopleCache(relay);
+    this.syncWatchObserver();
+  }
+  teardownRelayBindings() {
+    for (const off of this.relayUnsubs) {
+      try {
+        off();
+      } catch {
+      }
+    }
+    this.relayUnsubs = [];
+    this.disposeWatchObserver();
+    this.observedRelay = null;
+  }
+  disposeWatchObserver() {
+    if (this.watchObserver) {
+      try {
+        this.watchObserver.dispose();
+      } catch {
+      }
+      this.watchObserver = null;
+      this.watchKey = "";
+    }
+  }
+  /** Subscribes live to watched threads via `session.observe` for <1s reply reactivity. */
+  syncWatchObserver() {
+    const relay = this.observedRelay;
+    const live = this.state.watches.filter((w) => w.until > now());
+    if (!relay || live.length === 0) {
+      this.disposeWatchObserver();
+      return;
+    }
+    const roots = live.map((w) => w.rootId).sort();
+    const key = roots.join(",");
+    if (this.watchObserver && this.watchKey === key) return;
+    this.disposeWatchObserver();
+    this.watchKey = key;
+    const since = Math.min(...live.map((w) => w.since)) + 1;
+    try {
+      const obs = relay.session.observe([{ kinds: [9], "#e": roots, since, limit: 200 }]);
+      const unsub = obs.subscribe(() => {
+        const snap = obs.snapshot();
+        if (snap.events?.length) void this.ingestReplies(relay, snap.events);
+      });
+      this.watchObserver = {
+        refresh: () => obs.refresh(),
+        dispose: () => {
+          unsub();
+          obs.dispose();
+        }
+      };
+    } catch {
+      this.watchObserver = null;
+      this.watchKey = "";
+    }
+  }
+  rebuildPeopleFromSnapshot(relay) {
+    const channels = relay.channels();
+    const ids = /* @__PURE__ */ new Set();
+    for (const channel of channels) for (const id of channel.members ?? []) if (id !== relay.pubkey) ids.add(id);
+    const snap = relay.session.profiles.snapshot();
+    const names = /* @__PURE__ */ new Set();
+    for (const id of ids) {
+      const name = snap.get(id)?.name;
+      if (name) names.add(name);
+    }
+    if (names.size > 0) this.peopleCache = [...names].sort();
+  }
+  async refreshPeopleCache(relay) {
+    const channels = relay.channels();
+    const ids = /* @__PURE__ */ new Set();
+    for (const channel of channels) for (const id of channel.members ?? []) if (id !== relay.pubkey) ids.add(id);
+    if (ids.size === 0) return;
+    await relay.session.profiles.ensure([...ids].slice(0, 400)).catch(() => void 0);
+    this.rebuildPeopleFromSnapshot(relay);
+    this.peopleCacheAt = Date.now();
+  }
+  isSttReady(engine, settings) {
+    if (settings.sttBackend === "openai" && settings.sttUrl.trim()) return true;
+    return !!(engine?.engine && engine?.model);
   }
   llm() {
     const settings = this.state.settings;
-    if (!settings.llmUrl) return null;
+    if (!settings.llmUrl.trim()) return null;
     return { model: settings.llmModel || "default", post: llmPoster(this.deps.host, settings) };
   }
   updateSettings(patch) {
-    const settings = { ...this.state.settings, ...patch };
-    const restart = patch.modelDir !== void 0 && patch.modelDir !== this.state.settings.modelDir || patch.whisper !== void 0 && patch.whisper !== this.state.settings.whisper;
-    const micChanged = patch.microphone !== void 0 && patch.microphone !== this.state.settings.microphone;
+    const prev = this.state.settings;
+    const settings = { ...prev, ...patch };
+    const restartListener = patch.modelDir !== void 0 && patch.modelDir !== prev.modelDir || patch.whisper !== void 0 && patch.whisper !== prev.whisper || patch.sttBackend !== void 0 && patch.sttBackend !== prev.sttBackend;
+    const reconfigureListener = !restartListener && (patch.sttUrl !== void 0 && patch.sttUrl !== prev.sttUrl || patch.sttModel !== void 0 && patch.sttModel !== prev.sttModel || patch.sttKey !== void 0 && patch.sttKey !== prev.sttKey || patch.vadSilenceMs !== void 0 && patch.vadSilenceMs !== prev.vadSilenceMs);
+    const micChanged = patch.microphone !== void 0 && patch.microphone !== prev.microphone;
+    const localTtsChanged = patch.localTtsModel !== void 0 && patch.localTtsModel !== prev.localTtsModel || patch.modelDir !== void 0 && patch.modelDir !== prev.modelDir;
     saveSettings(settings);
-    this.set({ settings });
-    if (restart) this.listener.stop();
+    this.set({ settings, ready: this.isSttReady(this.state.engine, settings) });
+    if (restartListener) this.listener.stop();
+    if (reconfigureListener && this.listener.running) {
+      const silence = this.wantLiveMode ? Math.max(0.2, settings.vadSilenceMs / 1e3) : 0.6;
+      this.listener.configure(settings, silence);
+    }
     if (micChanged) this.recorder.release();
-    if ((restart || micChanged) && this.wantHandsFree) void this.setHandsFree(true);
+    if (localTtsChanged) void this.refreshTtsModel();
+    if (settings.ttsBackend === "local") void this.speaker.warm();
+    if ((restartListener || micChanged) && this.wantLiveMode) void this.setLiveMode(true);
+    else if ((restartListener || micChanged) && this.wantHandsFree) void this.setHandsFree(true);
   }
   async dropHandsFree(reason) {
     await this.setHandsFree(false, false);
     this.setStatus(reason, true);
   }
-  async warmListener() {
-    if (!this.state.engine?.runtime || !this.state.ready) return false;
+  async dropLive(reason) {
+    await this.setLiveMode(false);
+    this.setStatus(reason, true);
+  }
+  async warmListener(silenceSec) {
+    if (!this.state.engine?.runtime) return false;
+    const settings = this.state.settings;
+    if (settings.sttBackend === "local" && !this.state.ready) return false;
+    const silence = silenceSec ?? (this.wantLiveMode ? Math.max(0.2, settings.vadSilenceMs / 1e3) : 0.6);
     try {
-      return await this.listener.ensure(this.state.settings);
+      return await this.listener.ensure(settings, silence);
     } catch {
       return false;
     }
   }
+  handleLevel = (level) => {
+    if (this.levelFrame) return;
+    this.levelFrame = requestAnimationFrame(() => {
+      this.levelFrame = 0;
+      this.set({ level });
+    });
+  };
+  /** Turns Live Conversation Mode on/off: continuous no-wake-word dialogue with real barge-in and streaming LLM+TTS. */
+  async setLiveMode(on) {
+    this.wantLiveMode = on;
+    if (!on) {
+      this.clearBargeInTimer();
+      this.abortTurn();
+      this.speaker.stop();
+      if (!this.wantHandsFree) {
+        await this.recorder.listen(null);
+        this.listener.reset();
+      }
+      this.set({ liveMode: false, hearing: false, awake: false, opening: false, level: 0 });
+      this.syncActivity("");
+      return;
+    }
+    if (this.wantHandsFree) {
+      await this.setHandsFree(false, false);
+    }
+    const settings = this.state.settings;
+    if (!this.state.engine?.runtime) {
+      this.wantLiveMode = false;
+      this.setStatus("Live mode needs the fast speech runtime (Silero VAD). Install it in Settings.", true);
+      return;
+    }
+    if (!this.isSttReady(this.state.engine, settings)) {
+      this.wantLiveMode = false;
+      this.setStatus("Install the local Whisper model or configure an STT endpoint in Settings first.", true);
+      return;
+    }
+    if (!settings.llmUrl.trim() && !this.deps.decide()) {
+      this.wantLiveMode = false;
+      this.setStatus("Live mode needs a language model endpoint in Settings.", true);
+      return;
+    }
+    this.set({ opening: true, status: "Starting Live mode...", statusBad: false });
+    try {
+      const silenceSec = Math.max(0.2, Math.min(1.5, (settings.vadSilenceMs || 420) / 1e3));
+      const [started] = await Promise.all([this.warmListener(silenceSec), this.speaker.warm()]);
+      if (!this.wantLiveMode) return;
+      if (!started) throw new Error("The speech runtime did not start.");
+      await this.recorder.listen(
+        (pcm) => {
+          if (this.state.listening) return;
+          if (this.speaker.speaking && !this.state.settings.bargeIn) return;
+          this.listener.feed(pcmBase64(pcm));
+        },
+        settings.microphone,
+        this.handleLevel
+      );
+      if (!this.wantLiveMode) {
+        await this.recorder.listen(null);
+        return;
+      }
+      this.listener.reset();
+      this.speaker.cue("wake");
+      this.set({
+        liveMode: true,
+        handsFree: false,
+        opening: false,
+        huddlePaused: false,
+        status: "Live. Just talk \u2014 interrupt anytime.",
+        statusBad: false
+      });
+      this.syncActivity("");
+    } catch (error) {
+      if (!this.wantLiveMode) return;
+      this.wantLiveMode = false;
+      await this.recorder.listen(null);
+      this.set({ liveMode: false, opening: false });
+      this.setStatus(`Live mode: ${message(error)}`, true);
+      this.syncActivity("");
+    }
+  }
+  toggleLiveMode() {
+    void this.setLiveMode(!this.wantLiveMode);
+  }
   async setHandsFree(on, remember = true) {
     this.wantHandsFree = on;
     if (!on) {
-      await this.recorder.listen(null);
-      this.listener.reset();
-      this.set({ handsFree: false, hearing: false, awake: false, opening: false });
+      this.clearBargeInTimer();
+      if (!this.wantLiveMode) {
+        await this.recorder.listen(null);
+        this.listener.reset();
+      }
+      this.set({ handsFree: false, hearing: false, awake: false, opening: false, level: 0 });
       if (remember && this.state.settings.handsFree) this.updateSettings({ handsFree: false });
+      this.syncActivity("");
       return;
+    }
+    if (this.wantLiveMode) {
+      await this.setLiveMode(false);
     }
     if (!this.state.ready || !this.state.engine?.runtime) {
       this.wantHandsFree = false;
@@ -6763,26 +8317,33 @@ var Controller = class {
     }
     this.set({ opening: true, status: "Starting hands-free...", statusBad: false });
     try {
-      const started = await this.warmListener();
+      const started = await this.warmListener(0.6);
       if (!this.wantHandsFree) return;
       if (!started) throw new Error("The speech runtime did not start.");
-      await this.recorder.listen((pcm) => {
-        if (this.speaker.speaking || this.state.listening) return;
-        this.listener.feed(pcmBase64(pcm));
-      }, this.state.settings.microphone);
+      await this.recorder.listen(
+        (pcm) => {
+          if (this.state.listening) return;
+          if (this.speaker.speaking && !this.state.settings.bargeIn) return;
+          this.listener.feed(pcmBase64(pcm));
+        },
+        this.state.settings.microphone,
+        this.handleLevel
+      );
       if (!this.wantHandsFree) {
         await this.recorder.listen(null);
         return;
       }
       this.listener.reset();
-      this.set({ handsFree: true, opening: false, status: `Hands-free. Say \u201Chey ${this.wakeWord()}\u201D.`, statusBad: false });
+      this.set({ handsFree: true, opening: false, huddlePaused: false, status: `Hands-free. Say \u201Chey ${this.wakeWord()}\u201D.`, statusBad: false });
       if (!this.state.settings.handsFree) this.updateSettings({ handsFree: true });
+      this.syncActivity("");
     } catch (error) {
       if (!this.wantHandsFree) return;
       this.wantHandsFree = false;
       await this.recorder.listen(null);
       this.set({ handsFree: false, opening: false });
       this.setStatus(`Hands-free: ${message(error)}`, true);
+      this.syncActivity("");
     }
   }
   toggleHandsFree() {
@@ -6805,10 +8366,48 @@ var Controller = class {
     const match = new RegExp(`^\\W*(?:(?:hey|hi|ok|okay|a)[\\s,]+)?(?:${sounds})\\b[\\s,.!?:;-]*`, "i").exec(text3);
     return match ? text3.slice(match[0].length).trim() : null;
   }
+  clearBargeInTimer() {
+    if (this.bargeInTimer) {
+      clearTimeout(this.bargeInTimer);
+      this.bargeInTimer = null;
+    }
+  }
+  abortTurn() {
+    this.turn += 1;
+    if (this.activeAbort) {
+      this.activeAbort.abort();
+      this.activeAbort = null;
+    }
+  }
+  /** Interrupts active TTS and any in-flight LLM stream/tool turn immediately. */
+  interrupt(cue = false) {
+    this.clearBargeInTimer();
+    const wasActive = this.speaker.speaking || this.state.busy;
+    this.abortTurn();
+    this.speaker.stop();
+    if (wasActive && cue) this.speaker.cue("interrupt");
+    this.set({ busy: false });
+    this.syncActivity("");
+  }
   heard(heard) {
-    if (!this.state.handsFree) return;
+    if (!this.state.handsFree && !this.state.liveMode) return;
     if (heard.kind === "speech") {
       this.set({ hearing: heard.active });
+      this.syncActivity();
+      if (heard.active && this.state.settings.bargeIn && (this.speaker.speaking || this.state.busy)) {
+        const allowBarge = this.state.liveMode || Date.now() < this.awakeUntil;
+        if (allowBarge && !this.bargeInTimer) {
+          this.bargeInTimer = setTimeout(() => {
+            this.bargeInTimer = null;
+            if (this.state.hearing && (this.speaker.speaking || this.state.busy)) {
+              this.interrupt(true);
+              this.setStatus("Listening...");
+            }
+          }, BARGE_IN_CONFIRM_MS);
+        }
+      } else if (!heard.active) {
+        this.clearBargeInTimer();
+      }
       return;
     }
     if (heard.kind === "error") {
@@ -6816,7 +8415,13 @@ var Controller = class {
       return;
     }
     const text3 = heard.text;
-    if (!text3 || /^\[?(blank_audio|silence|music|noise)\]?$/i.test(text3) || /^[\W_]*$/.test(text3)) return;
+    if (!text3 || /^\[?(blank_audio|silence|music|noise|applause|laughter)\]?$/i.test(text3) || /^[\W_]*$/.test(text3)) return;
+    if (this.state.liveMode) {
+      if (NOISE.test(text3) && !this.awaitingYesNo && !this.state.pending) return;
+      if (this.speaker.speaking || this.state.busy) this.interrupt(false);
+      void this.handleTranscript(text3);
+      return;
+    }
     const command = this.afterWake(text3);
     if (command === null) {
       if (Date.now() >= this.awakeUntil || NOISE.test(text3)) return;
@@ -6825,22 +8430,47 @@ var Controller = class {
       } else if (text3.split(/\s+/).length < 3) return;
     }
     if (command === "") {
-      this.speaker.stop();
+      this.interrupt(true);
       this.wake(FOLLOW_UP_MS);
       this.setStatus("Listening...");
       return;
     }
     this.awakeUntil = 0;
     this.set({ awake: false });
+    if (this.speaker.speaking || this.state.busy) this.interrupt(false);
     void this.handleTranscript(command ?? text3);
   }
   async refreshEngine() {
     try {
       const engine = await checkEngine(this.deps.host, this.state.settings);
-      this.set({ engine, engineError: "", ready: engine.engine && engine.model });
+      this.set({ engine, engineError: "", ready: this.isSttReady(engine, this.state.settings) });
       this.adoptBuzzVoice(engine);
     } catch (error) {
-      this.set({ engine: null, engineError: message(error), ready: false });
+      this.set({
+        engine: null,
+        engineError: message(error),
+        ready: this.isSttReady(null, this.state.settings)
+      });
+    }
+  }
+  async refreshTtsModel() {
+    if (!this.state.engine) return;
+    const ttsModel = await checkTtsModel(this.deps.host, this.state.settings);
+    this.set({ engine: { ...this.state.engine, ttsModel } });
+  }
+  async installLocalTts() {
+    this.set({ installing: "Downloading local voice model", engineError: "" });
+    try {
+      const ok = await installTtsModel(this.deps.host, this.state.settings, (step) => {
+        this.set({
+          installing: step === "runtime" ? "Installing speech runtime" : `Downloading ${this.state.settings.localTtsModel}`
+        });
+      });
+      const current = this.state.engine ?? { engine: false, model: false, runtime: true, ttsModel: ok, buzzVoice: null };
+      this.set({ engine: { ...current, runtime: true, ttsModel: ok }, installing: "" });
+      if (ok) void this.speaker.warm();
+    } catch (error) {
+      this.set({ installing: "", engineError: message(error) });
     }
   }
   adoptBuzzVoice(engine) {
@@ -6851,15 +8481,28 @@ var Controller = class {
     const model = typeof saved.llm_model === "string" ? saved.llm_model : "";
     if (url) this.updateSettings({ llmUrl: url, llmModel: settings.llmModel || model });
   }
+  async installRuntimeOnly() {
+    this.set({ installing: "Installing fast speech runtime", engineError: "" });
+    try {
+      await installRuntime(this.deps.host, this.state.settings);
+      const current = this.state.engine ?? { engine: false, model: false, runtime: true, ttsModel: false, buzzVoice: null };
+      const engine = { ...current, runtime: true };
+      this.set({ engine, installing: "", ready: this.isSttReady(engine, this.state.settings) });
+    } catch (error) {
+      this.set({ installing: "", engineError: message(error) });
+    }
+  }
   async install() {
     this.set({ installing: "Starting", engineError: "" });
     try {
       const engine = await installEngine(
         this.deps.host,
         this.state.settings,
-        (step) => this.set({ installing: step === "engine" ? "Downloading the speech engine" : "Downloading the whisper model" })
+        (step) => this.set({
+          installing: step === "engine" ? "Downloading the speech engine" : step === "runtime" ? "Installing fast speech runtime" : "Downloading the whisper model"
+        })
       );
-      this.set({ engine, installing: "", ready: engine.engine && engine.model });
+      this.set({ engine, installing: "", ready: this.isSttReady(engine, this.state.settings) });
     } catch (error) {
       this.set({ installing: "", engineError: message(error) });
     }
@@ -6868,10 +8511,19 @@ var Controller = class {
     this.set({ status, statusBad: bad });
   }
   say(role, text3, extra = {}) {
-    const entry = { id: this.nextId++, role, text: text3, ...extra };
+    const id = this.nextId++;
+    const entry = { id, role, text: text3, ...extra };
     this.set({ log: [...this.state.log, entry].slice(-MAX_LOG) });
     this.history.push({ role, text: text3 });
     if (this.history.length > HISTORY_TURNS) this.history.splice(0, this.history.length - HISTORY_TURNS);
+    return id;
+  }
+  updateLogEntry(id, patch) {
+    const idx = this.state.log.findIndex((entry) => entry.id === id);
+    if (idx < 0) return;
+    const next = [...this.state.log];
+    next[idx] = { ...next[idx], ...patch };
+    this.set({ log: next });
   }
   reply(text3, opts = {}) {
     this.say("app", text3, { bad: opts.bad });
@@ -6879,45 +8531,43 @@ var Controller = class {
     this.speaker.speak(text3);
   }
   newSession() {
-    this.turn += 1;
+    this.interrupt(false);
     this.scope = emptyScope();
     this.history = [];
+    this.agentHistory = [];
     this.awaitingYesNo = false;
     this.set({ log: [], pending: null, scope: "", busy: false, status: "" });
+    this.syncActivity("");
   }
   stopSpeaking() {
-    this.speaker.stop();
+    this.interrupt(false);
   }
   voices() {
     return listVoices(this.deps.host);
   }
   testVoice() {
     this.speaker.stop();
-    this.speaker.speak("Hi, this is how Buzz Voice will sound.", true);
+    this.speaker.speak("Hi, this is how Buzz Voice sounds.", true);
   }
   async startListening() {
     if (this.state.listening || this.state.transcribing) return;
     if (!this.state.ready) {
-      this.setStatus("Install the speech engine in Settings first.", true);
+      this.setStatus("Install the speech engine or configure an STT endpoint in Settings first.", true);
       return;
     }
     if (this.state.opening) return;
-    this.speaker.stop();
+    this.interrupt(false);
     this.stopWhenOpen = false;
     if (!this.recorder.open) this.set({ opening: true, status: "Opening the microphone...", statusBad: false });
     try {
-      await this.recorder.start((level) => {
-        if (this.levelFrame) return;
-        this.levelFrame = requestAnimationFrame(() => {
-          this.levelFrame = 0;
-          this.set({ level });
-        });
-      }, this.state.settings.microphone);
+      await this.recorder.start(this.handleLevel, this.state.settings.microphone);
       this.set({ opening: false, listening: true, latched: false, status: "Listening...", statusBad: false });
+      this.syncActivity("");
       if (this.stopWhenOpen) await this.stopListening();
     } catch (error) {
       this.set({ opening: false });
       this.setStatus(`Microphone: ${message(error)}`, true);
+      this.syncActivity("");
     }
   }
   warmMicrophone() {
@@ -6942,6 +8592,7 @@ var Controller = class {
     if (!this.state.listening) return;
     const audio = await this.recorder.stop();
     this.set({ listening: false, latched: false, level: 0, transcribing: true, status: "Transcribing..." });
+    this.syncActivity("");
     try {
       if (!audio || audio.seconds < 0.3 || audio.peak < 0.01) {
         this.setStatus("I did not hear anything.");
@@ -6958,24 +8609,33 @@ var Controller = class {
       this.setStatus(message(error), true);
     } finally {
       this.set({ transcribing: false });
+      this.syncActivity("");
     }
   }
   cancelListening() {
     this.recorder.cancel();
     this.set({ listening: false, latched: false, level: 0, status: "" });
+    this.syncActivity("");
   }
   submitText(text3) {
     const trimmed = text3.trim();
-    if (trimmed) void this.handleTranscript(trimmed);
+    if (!trimmed) return;
+    if (this.speaker.speaking || this.state.busy) this.interrupt(false);
+    void this.handleTranscript(trimmed);
   }
   channels() {
     return this.deps.relay()?.channels() ?? [];
   }
   async people(relay, channels) {
+    if (this.peopleCache.length > 0 && Date.now() - this.peopleCacheAt < 5 * 6e4) {
+      return this.peopleCache;
+    }
     const ids = /* @__PURE__ */ new Set();
     for (const channel of channels) for (const id of channel.members ?? []) if (id !== relay.pubkey) ids.add(id);
     const names = await relay.profiles([...ids].slice(0, 400));
-    return [...new Set(names.values())].filter(Boolean).sort();
+    this.peopleCache = [...new Set(names.values())].filter(Boolean).sort();
+    this.peopleCacheAt = Date.now();
+    return this.peopleCache;
   }
   async handleTranscript(text3) {
     this.say("you", text3);
@@ -6985,21 +8645,432 @@ var Controller = class {
       return;
     }
     if (this.awaitingYesNo && this.state.pending) {
-      this.awaitingYesNo = false;
-      if (NO.test(text3)) this.cancel();
-      else if (YES.test(text3)) await this.publish();
-      else {
+      const words2 = text3.trim().split(/\s+/).length;
+      if (words2 <= 5 && NO.test(text3) && !YES.test(text3)) {
+        this.awaitingYesNo = false;
         this.cancel();
-        await this.route(relay, text3);
+        return;
       }
+      if (words2 <= 5 && YES.test(text3) && !NO.test(text3)) {
+        this.awaitingYesNo = false;
+        await this.publish();
+        return;
+      }
+    }
+    if (this.state.settings.llmUrl.trim()) {
+      await this.converse(relay, text3);
       return;
     }
+    if (this.awaitingYesNo && this.state.pending) {
+      this.awaitingYesNo = false;
+      this.cancel();
+    }
     await this.route(relay, text3);
+  }
+  buildAgentContext(relay) {
+    const channels = this.channels();
+    if (this.peopleCache.length === 0) void this.refreshPeopleCache(relay);
+    const scopeLines2 = [];
+    if (this.scope.channel) scopeLines2.push(`Channel: ${this.scope.channel.name}`);
+    if (this.scope.threads.length > 0) {
+      scopeLines2.push("Threads (1-based):");
+      this.scope.threads.forEach((t, i) => {
+        const star = this.scope.focus?.rootId === t.rootId ? " [focused]" : "";
+        scopeLines2.push(`  ${i + 1}. ${t.label}${t.who.length ? ` (${t.who.join(", ")})` : ""}${star}`);
+      });
+    }
+    const pending = this.state.pending;
+    let pendingSummary = "";
+    if (pending) {
+      pendingSummary = pending.todo ? `Todo (${pending.todo.op}) in #${pending.channel.name}: "${pending.todo.label}"${pending.todo.assignee ? ` assigned to ${pending.todo.assignee.name}` : ""}` : `Message to #${pending.channel.name}${pending.label ? ` (replying in "${pending.label}")` : " (new thread)"}: "${pending.body}"`;
+    }
+    const watchesSummary = this.state.watches.slice(0, 5).map((w) => `- #${w.channelName}: ${w.label}`).join("\n");
+    return {
+      channels: channels.map((c) => ({ name: c.name, description: c.description })),
+      people: this.peopleCache,
+      scopeSummary: scopeLines2.join("\n"),
+      pendingSummary,
+      watchesSummary,
+      confirmBeforeSend: this.state.settings.confirmBeforeSend
+    };
+  }
+  pushAgentHistory(messages) {
+    this.agentHistory.push(...messages);
+    if (this.agentHistory.length > AGENT_HISTORY_MAX) {
+      let cut = this.agentHistory.length - AGENT_HISTORY_MAX;
+      while (cut < this.agentHistory.length && this.agentHistory[cut].role !== "user") cut += 1;
+      this.agentHistory = cut < this.agentHistory.length ? this.agentHistory.slice(cut) : this.agentHistory.slice(-8);
+    }
+  }
+  /** Streaming conversational tool-calling loop with live bubble updates and instant barge-in abort. */
+  async converse(relay, text3) {
+    this.abortTurn();
+    const ticket = this.turn;
+    const abort = new AbortController();
+    this.activeAbort = abort;
+    const live = () => ticket === this.turn && !abort.signal.aborted;
+    this.set({ busy: true });
+    this.syncActivity("Thinking...");
+    this.setStatus("Thinking...");
+    const userMsg = { role: "user", content: text3 };
+    const baseHistory = [...this.agentHistory, userMsg];
+    let bubbleId = null;
+    try {
+      const result = await runAgentTurn({
+        host: this.deps.host,
+        settings: this.state.settings,
+        history: baseHistory,
+        context: () => this.buildAgentContext(relay),
+        executeTool: (name, args) => this.executeAgentTool(relay, name, args, live),
+        onActivity: (label) => {
+          if (!live()) return;
+          this.setStatus(label);
+          this.syncActivity(label);
+        },
+        onTextUpdate: (accumulated) => {
+          if (!live() || !accumulated) return;
+          if (bubbleId === null) {
+            bubbleId = this.say("app", accumulated, { streaming: true });
+          } else {
+            this.updateLogEntry(bubbleId, { text: accumulated, streaming: true });
+          }
+        },
+        onSpeak: (sentence) => {
+          if (!live()) return;
+          this.speaker.speak(sentence);
+        },
+        signal: abort.signal
+      });
+      if (bubbleId !== null) {
+        this.updateLogEntry(bubbleId, { streaming: false });
+      }
+      if (result.aborted) {
+        const partial = result.spoken.trim();
+        this.pushAgentHistory([
+          userMsg,
+          ...partial ? [{ role: "assistant", content: `${partial} [interrupted by user]` }] : []
+        ]);
+        return;
+      }
+      this.pushAgentHistory([userMsg, ...result.newMessages]);
+      if (result.spoken && bubbleId === null) {
+        this.say("app", result.spoken);
+      }
+      if (live()) {
+        this.setStatus(this.state.liveMode ? "Live. Just talk \u2014 interrupt anytime." : "");
+      }
+    } catch (error) {
+      if (bubbleId !== null) this.updateLogEntry(bubbleId, { streaming: false });
+      if (live()) {
+        this.reply(message(error), { bad: true });
+      }
+    } finally {
+      if (this.activeAbort === abort) this.activeAbort = null;
+      if (ticket === this.turn) {
+        this.set({ busy: false });
+        this.syncActivity("");
+      }
+    }
+  }
+  async executeAgentTool(relay, name, args, live) {
+    const channels = this.channels();
+    const resolveChan = (spokenName) => {
+      const s = typeof spokenName === "string" ? spokenName.trim() : "";
+      if (s) return matchChannel(channels, s, s);
+      return this.scope.channel;
+    };
+    switch (name) {
+      case "list_channels": {
+        const list2 = channels.map((c) => `${c.name}${c.description ? ` \u2014 ${c.description.slice(0, 100)}` : ""}`);
+        return { result: list2.length ? list2.join("\n") : "No channels found." };
+      }
+      case "read_channel": {
+        const channel = resolveChan(args.channel);
+        if (!channel) return { result: `No channel matched "${String(args.channel ?? "")}".` };
+        const limit = Math.max(1, Math.min(15, Number(args.limit) || 8));
+        const all2 = await relay.threads(channel.id);
+        if (!live()) return { result: "Aborted." };
+        if (all2.length === 0) {
+          this.scope = setThreads(this.scope, channel, [], null);
+          this.paintScope();
+          return { result: `#${channel.name} has no messages.` };
+        }
+        const recent = all2.slice(-limit);
+        const names = await relay.profiles([...new Set(recent.flatMap((t) => t.messages.map((m) => m.pubkey)))]);
+        const described = recent.map((t) => describeThread(t, names));
+        this.scope = setThreads(this.scope, channel, described, described[described.length - 1] ?? null);
+        this.paintScope();
+        const blocks = recent.map((t, i) => block(t, i, names));
+        return { result: `Channel #${channel.name} (${recent.length} recent threads, oldest first):
+
+${blocks.join("\n\n")}` };
+      }
+      case "read_thread": {
+        const channel = resolveChan(args.channel);
+        if (!channel) return { result: "No channel specified or in focus." };
+        const ref = typeof args.thread_ref === "number" ? args.thread_ref : null;
+        const hint = typeof args.thread_hint === "string" && args.thread_hint.trim() ? args.thread_hint.trim() : null;
+        let target = resolveThread(this.scope, channel, ref);
+        if (!target || hint) {
+          const all2 = await relay.threads(channel.id);
+          if (!live()) return { result: "Aborted." };
+          if (all2.length === 0) return { result: `#${channel.name} has no threads.` };
+          const recent = all2.slice(-12);
+          const names2 = await relay.profiles([...new Set(recent.flatMap((t) => t.messages.map((m) => m.pubkey)))]);
+          const owned = recent.map((t) => ({ ...describeThread(t, names2), channelId: channel.id, channelName: channel.name }));
+          if (hint) {
+            const picked = await pickThread({
+              llm: this.llm(),
+              decide: this.deps.decide(),
+              community: this.deps.community(),
+              channelName: channel.name,
+              hint,
+              transcript: hint,
+              labels: owned.map((t) => t.label)
+            }).catch(() => null);
+            target = picked ? owned[picked - 1] : owned[owned.length - 1];
+          } else {
+            target = owned[owned.length - 1];
+          }
+          this.scope = setThreads(this.scope, channel, owned, target);
+          this.paintScope();
+        }
+        const [root, replies] = await Promise.all([
+          relay.byIds([target.rootId]),
+          relay.messagesInThread(channel.id, target.rootId)
+        ]);
+        if (!live()) return { result: "Aborted." };
+        const messages = [...root, ...replies].filter((e, i, list2) => list2.findIndex((x) => x.id === e.id) === i).sort((a, b) => a.created_at - b.created_at);
+        const names = await relay.profiles([...new Set(messages.map((m) => m.pubkey))]);
+        const one2 = {
+          rootId: target.rootId,
+          messages: messages.slice(-24),
+          lastAt: messages.at(-1)?.created_at ?? now()
+        };
+        this.scope = { ...this.scope, channel, focus: target };
+        this.paintScope();
+        this.watch({ rootId: target.rootId, channelId: channel.id, channelName: channel.name, label: target.label, since: one2.lastAt });
+        return { result: `Thread in #${channel.name} ("${target.label}"):
+${block(one2, 0, names)}` };
+      }
+      case "check_inbox": {
+        const days = Math.max(1, Math.min(14, Number(args.days) || INBOX_DAYS));
+        const since = now() - days * 86400;
+        const mentions = await relay.mentions(since);
+        if (!live()) return { result: "Aborted." };
+        const byRoot = /* @__PURE__ */ new Map();
+        for (const event of mentions) {
+          const channelId = tagValue(event, "h");
+          if (!channelId) continue;
+          const root = rootOf(event);
+          const bucket = byRoot.get(root);
+          if (bucket) bucket.events.push(event);
+          else byRoot.set(root, { channelId, events: [event] });
+        }
+        const answered = /* @__PURE__ */ new Map();
+        for (const event of await relay.mineIn([...byRoot.keys()])) {
+          const root = rootOf(event);
+          answered.set(root, Math.max(answered.get(root) ?? 0, event.created_at));
+        }
+        const newest = (item) => item.events[item.events.length - 1].created_at;
+        const unread = [...byRoot.entries()].filter(([root, item]) => newest(item) > (answered.get(root) ?? 0)).sort((a, b) => newest(a[1]) - newest(b[1])).slice(-8);
+        if (unread.length === 0) {
+          this.scope = setItems(this.scope.channel, [], null);
+          this.paintScope();
+          return { result: "Inbox is clear. Zero unread mentions." };
+        }
+        const names = await relay.profiles([...new Set(unread.flatMap(([, item]) => item.events.map((e) => e.pubkey)))]);
+        const channelName = (id) => channels.find((c) => c.id === id)?.name ?? "a channel";
+        const described = unread.map(([root, item]) => {
+          const last = item.events[item.events.length - 1];
+          return {
+            rootId: root,
+            channelId: item.channelId,
+            channelName: channelName(item.channelId),
+            label: plain(last.content).slice(0, 70) || root.slice(0, 8),
+            who: [...new Set(item.events.map((e) => names.get(e.pubkey) ?? e.pubkey.slice(0, 8)))],
+            lastAt: last.created_at
+          };
+        });
+        const top = described[described.length - 1] ?? null;
+        const home = top ? channels.find((c) => c.id === top.channelId) ?? null : null;
+        this.scope = setItems(home ?? this.scope.channel, described, top);
+        this.paintScope();
+        const blocks = unread.map(([, item], index2) => {
+          const lines = item.events.slice(-4).map((e) => {
+            const who = names.get(e.pubkey) ?? e.pubkey.slice(0, 8);
+            return `  ${who}: ${e.content.replace(/\s+/g, " ").slice(0, 400)}`;
+          });
+          return `Unread ${index2 + 1} in #${channelName(item.channelId)}:
+${lines.join("\n")}`;
+        });
+        return { result: `${unread.length} unread thread(s):
+
+${blocks.join("\n\n")}` };
+      }
+      case "list_todos": {
+        const channel = resolveChan(args.channel);
+        if (!channel) return { result: "No channel specified or in focus." };
+        const head = await relay.readCanvas(channel.id);
+        const items = readTodos(head?.content ?? "").items;
+        if (items.length === 0) return { result: `#${channel.name} has no todos.` };
+        const lines = items.map((item) => {
+          const who = item.assignee?.name ?? item.namedAssignee?.name;
+          return `[${item.status}] ${plain(item.label)}${who ? ` (@${who})` : ""}`;
+        });
+        return { result: `Todos in #${channel.name} (${items.length} total):
+${lines.join("\n")}` };
+      }
+      case "draft_message": {
+        const channel = resolveChan(args.channel);
+        if (!channel) return { result: `Could not find channel "${String(args.channel ?? "")}". Ask the user which channel.` };
+        const rawMsg = String(args.message ?? "").trim();
+        if (!rawMsg) return { result: "Message body is empty." };
+        const newThread = args.new_thread === true;
+        const ref = typeof args.thread_ref === "number" ? args.thread_ref : null;
+        const hint = typeof args.thread_hint === "string" && args.thread_hint.trim() ? args.thread_hint.trim() : null;
+        let target = null;
+        if (!newThread) {
+          target = resolveThread(this.scope, channel, ref);
+          if (!target || hint) {
+            const fakeIntent = {
+              action: "post",
+              todo_op: "add",
+              channel: channel.name,
+              recipient: null,
+              continues_previous: false,
+              thread: "existing",
+              thread_ref: ref,
+              thread_hint: hint,
+              new_thread: false,
+              instruction: rawMsg,
+              filter: "all",
+              spoken_confirmation: ""
+            };
+            target = await this.findThread(relay, channel, fakeIntent, hint ?? rawMsg);
+          }
+        }
+        if (!live()) return { result: "Aborted." };
+        const members = await this.rankedMembers(relay, channel, target?.rootId ?? null);
+        if (!live()) return { result: "Aborted." };
+        const recipientSpoken = typeof args.recipient === "string" && args.recipient.trim() ? args.recipient.trim() : null;
+        const mention = recipientSpoken ? bestPerson(members, (m) => m.name, recipientSpoken, rawMsg) : null;
+        const addressed = mention?.name ?? recipientSpoken;
+        const body = addressed && !rawMsg.toLowerCase().startsWith(`@${addressed.toLowerCase()}`) ? `@${addressed} ${rawMsg}` : rawMsg;
+        const pending = {
+          todo: null,
+          channel,
+          replyTo: target?.rootId ?? null,
+          label: target?.label ?? null,
+          orphaned: !newThread && !target,
+          body,
+          addressed,
+          members
+        };
+        this.set({ pending });
+        if (!this.state.settings.confirmBeforeSend) {
+          await this.publish(true);
+          return { result: `Sent to #${channel.name}${target ? ` in thread "${target.label}"` : ""}: "${body}". Now watching for replies.` };
+        }
+        this.awaitingYesNo = true;
+        return {
+          result: `Draft staged for #${channel.name}${target ? ` in thread "${target.label}"` : " (new thread)"}: "${body}". Waiting for user confirmation.`
+        };
+      }
+      case "send_draft": {
+        if (!this.state.pending) return { result: "There is no pending draft to send." };
+        const desc = this.state.pending.todo ? `${this.state.pending.todo.op} todo "${this.state.pending.todo.label}" in #${this.state.pending.channel.name}` : `message to #${this.state.pending.channel.name}`;
+        await this.publish(true);
+        return { result: `Published ${desc}.` };
+      }
+      case "cancel_draft": {
+        if (!this.state.pending) return { result: "There was no pending draft." };
+        this.awaitingYesNo = false;
+        this.set({ pending: null });
+        return { result: "Draft cancelled." };
+      }
+      case "manage_todo": {
+        const channel = resolveChan(args.channel);
+        if (!channel) return { result: `Could not find channel "${String(args.channel ?? "")}".` };
+        const op = String(args.op ?? "add");
+        const phrase = String(args.label ?? "").trim().replace(/[.!?]+$/, "");
+        if (!phrase) return { result: "No todo label provided." };
+        const head = await relay.readCanvas(channel.id);
+        if (!live()) return { result: "Aborted." };
+        const items = readTodos(head?.content ?? "").items;
+        let existing = null;
+        if (op !== "add") {
+          const status = op === "assign" ? null : OP_STATUS[op];
+          existing = findTodo(items, phrase, status ? (item) => item.status !== status : void 0);
+          if (!existing) return { result: `No todo in #${channel.name} matched "${phrase}".` };
+        }
+        const hint = typeof args.thread_hint === "string" && args.thread_hint.trim() ? args.thread_hint.trim() : null;
+        const target = resolveThread(this.scope, channel, null) ?? (hint ? await this.findThread(relay, channel, {
+          action: "todo",
+          todo_op: op,
+          channel: channel.name,
+          recipient: null,
+          continues_previous: false,
+          thread: "existing",
+          thread_ref: null,
+          thread_hint: hint,
+          new_thread: false,
+          instruction: phrase,
+          filter: "all",
+          spoken_confirmation: ""
+        }, hint) : null);
+        const members = await this.rankedMembers(relay, channel, target?.rootId ?? null);
+        const assigneeSpoken = typeof args.assignee === "string" && args.assignee.trim() ? args.assignee.trim() : null;
+        const assignee = assigneeSpoken ? bestPerson(members, (m) => m.name, assigneeSpoken, phrase) : null;
+        if (assigneeSpoken && !assignee) return { result: `Nobody called "${assigneeSpoken}" is in #${channel.name}.` };
+        if (op === "assign" && !assignee) return { result: "Need an assignee name." };
+        const label = existing?.label ?? phrase.charAt(0).toUpperCase() + phrase.slice(1);
+        const body = assignee && (op === "add" || op === "assign") ? `@${assignee.name} ${label}` : "";
+        const pending = {
+          todo: { op, label, offset: existing?.offset ?? null, assignee },
+          channel,
+          replyTo: target?.rootId ?? null,
+          label: target?.label ?? null,
+          orphaned: false,
+          body,
+          addressed: assignee?.name ?? null,
+          members
+        };
+        this.set({ pending });
+        if (!this.state.settings.confirmBeforeSend) {
+          await this.publish(true);
+          return { result: `Saved todo (${op}) "${label}" in #${channel.name}${assignee ? ` for ${assignee.name}` : ""}.` };
+        }
+        this.awaitingYesNo = true;
+        return { result: `Todo draft staged (${op}) "${label}" in #${channel.name}${assignee ? ` for ${assignee.name}` : ""}. Waiting for user confirmation.` };
+      }
+      case "tracked_status": {
+        await this.refreshTracked(relay);
+        const filter = typeof args.filter === "string" ? args.filter : "all";
+        return { result: this.summarizeTracked(filter) };
+      }
+      case "flag_thread": {
+        const emoji = String(args.emoji ?? "").replace(/\uFE0F/g, "").trim();
+        if (!emoji) return { result: "No emoji provided." };
+        const channel = resolveChan(args.channel);
+        const ref = typeof args.thread_ref === "number" ? args.thread_ref : null;
+        const target = channel ? resolveThread(this.scope, channel, ref) : this.scope.focus;
+        if (!target) return { result: "No thread is in focus to flag." };
+        if (!relay.canReact()) return { result: "This Buzz connection cannot add reactions." };
+        const [root] = await relay.byIds([target.rootId]);
+        if (!root) return { result: "Could not find the thread root message." };
+        relay.react(root, emoji);
+        return { result: `Flagged "${target.label}" in #${target.channelName || channel?.name || "channel"} with ${emoji}.` };
+      }
+      default:
+        return { result: `Unknown tool "${name}".` };
+    }
   }
   async route(relay, text3) {
     const ticket = ++this.turn;
     const live = () => ticket === this.turn;
     this.set({ busy: true });
+    this.syncActivity("Working out what you meant...");
     try {
       this.setStatus("Working out what you meant...");
       const channels = this.channels();
@@ -7074,13 +9145,20 @@ var Controller = class {
           members
         }
       });
+      if (!this.state.settings.confirmBeforeSend) {
+        await this.publish();
+        return;
+      }
       this.setStatus("Edit it if you need to, then send. Or say yes.");
       this.speaker.speak(intent.spoken_confirmation || `Send to ${channel.name}?`);
       this.awaitingYesNo = true;
     } catch (error) {
       if (live()) this.reply(message(error), { bad: true });
     } finally {
-      if (live()) this.set({ busy: false });
+      if (live()) {
+        this.set({ busy: false });
+        this.syncActivity("");
+      }
     }
   }
   async planTodo(relay, channel, intent, text3, live) {
@@ -7132,6 +9210,10 @@ var Controller = class {
         members
       }
     });
+    if (!this.state.settings.confirmBeforeSend) {
+      await this.publish();
+      return;
+    }
     const verb = { add: "Add", assign: "Assign", start: "Start", done: "Finish", reopen: "Reopen" }[op];
     const who = assignee && (op === "add" || op === "assign") ? ` for ${assignee.name}` : "";
     this.setStatus("Edit it if you need to, then confirm. Or say yes.");
@@ -7161,7 +9243,7 @@ var Controller = class {
     const body = member ? `@${member.name} ${pending.todo.label}` : "";
     this.set({ pending: { ...pending, todo: { ...pending.todo, assignee: member }, body, addressed: member?.name ?? null } });
   }
-  async publishTodo(relay, pending) {
+  async publishTodo(relay, pending, silent = false) {
     const todo = pending.todo;
     const { channel, replyTo } = pending;
     const label = todo.op === "add" ? todo.label.replace(/\s+/g, " ").trim() : todo.label;
@@ -7188,7 +9270,7 @@ var Controller = class {
     if (!body || mentioned.length === 0) {
       this.say("app", label, { meta: `${done} in ${channel.name} todos` });
       this.setStatus("");
-      this.speaker.speak(`${done}.`);
+      if (!silent) this.speaker.speak(`${done}.`);
       return;
     }
     const event = relay.postMessage({
@@ -7204,7 +9286,7 @@ var Controller = class {
       link: { channelId: channel.id, messageId: event.id, rootId }
     });
     this.setStatus(`${done}. Watching for a reply.`);
-    this.speaker.speak(`${done}, and told ${mentioned[0].name}.`);
+    if (!silent) this.speaker.speak(`${done}, and told ${mentioned[0].name}.`);
   }
   async rankedMembers(relay, channel, rootId) {
     const [roster, recent, thread] = await Promise.all([
@@ -7360,7 +9442,7 @@ var Controller = class {
     if (this.state.pending) this.say("app", "Cancelled.");
     this.set({ pending: null, status: "" });
   }
-  async publish() {
+  async publish(silent = false) {
     const relay = this.deps.relay();
     const pending = this.state.pending;
     if (!relay || !pending) return;
@@ -7368,7 +9450,7 @@ var Controller = class {
       this.awaitingYesNo = false;
       this.set({ pending: null });
       try {
-        await this.publishTodo(relay, pending);
+        await this.publishTodo(relay, pending, silent);
       } catch (error) {
         this.reply(`That did not save: ${message(error)}`, { bad: true });
       }
@@ -7417,7 +9499,7 @@ var Controller = class {
         link: { channelId: channel.id, messageId: event.id, rootId }
       });
       this.setStatus(`Posted to ${channel.name}. Watching for a reply.`);
-      this.speaker.speak("Posted.");
+      if (!silent) this.speaker.speak("Posted.");
     } catch (error) {
       this.reply(`That did not send: ${message(error)}`, { bad: true });
     }
@@ -7428,14 +9510,114 @@ var Controller = class {
     const watches = [watch, ...rest].slice(0, MAX_WATCHES);
     saveJson(WATCH_KEY, watches);
     this.set({ watches });
+    this.syncWatchObserver();
   }
   unwatch(rootId) {
     const watches = this.state.watches.filter((w) => w.rootId !== rootId);
     saveJson(WATCH_KEY, watches);
     this.set({ watches });
+    this.syncWatchObserver();
   }
   isWatching(rootId) {
     return this.state.watches.some((w) => w.rootId === rootId);
+  }
+  async ingestReplies(relay, events) {
+    const live = this.state.watches.filter((w) => w.until > now());
+    if (live.length === 0) return;
+    const byRoot = new Map(live.map((w) => [w.rootId, w]));
+    const fresh = [];
+    for (const event of events) {
+      if (event.pubkey === relay.pubkey || this.seenReplyIds.has(event.id)) continue;
+      const watch = byRoot.get(rootOf(event)) ?? byRoot.get(event.id);
+      if (!watch || event.created_at <= watch.since) continue;
+      this.seenReplyIds.add(event.id);
+      fresh.push({ watch, event });
+    }
+    if (fresh.length === 0) return;
+    if (this.seenReplyIds.size > 500) {
+      this.seenReplyIds = new Set([...this.seenReplyIds].slice(-250));
+    }
+    const names = await relay.profiles([...new Set(fresh.map((f) => f.event.pubkey))]);
+    const seen = /* @__PURE__ */ new Map();
+    for (const { watch, event } of fresh) {
+      seen.set(watch.rootId, Math.max(seen.get(watch.rootId) ?? 0, event.created_at));
+    }
+    const watches = this.state.watches.map((w) => seen.has(w.rootId) ? { ...w, since: seen.get(w.rootId) } : w);
+    saveJson(WATCH_KEY, watches);
+    this.set({ watches });
+    const channels = this.channels();
+    for (const { watch, event } of fresh.sort((a, b) => a.event.created_at - b.event.created_at)) {
+      const who = names.get(event.pubkey) ?? event.pubkey.slice(0, 8);
+      this.say("app", event.content, {
+        meta: `${who} in ${watch.channelName}`,
+        link: { channelId: watch.channelId, messageId: event.id, rootId: watch.rootId }
+      });
+      this.tracked = this.tracked.map(
+        (t) => t.rootId === watch.rootId ? { ...t, lastReply: event.content.replace(/\s+/g, " ").slice(0, 240) } : t
+      );
+      const ch = channels.find((c) => c.id === watch.channelId) ?? { id: watch.channelId, name: watch.channelName };
+      this.scope = rememberPost(this.scope, ch, {
+        rootId: watch.rootId,
+        channelId: watch.channelId,
+        channelName: watch.channelName,
+        label: watch.label,
+        who: [who],
+        lastAt: event.created_at
+      });
+      this.paintScope();
+      this.pushAgentHistory([
+        {
+          role: "user",
+          content: `[Incoming reply from ${who} in #${watch.channelName} on thread "${watch.label}"]: ${event.content.slice(0, 800)}`
+        }
+      ]);
+      if (!this.state.listening && !this.state.hearing) {
+        await this.announceReply(who, watch.channelName, event.content);
+      }
+    }
+    saveJson(TRACK_KEY, this.tracked.slice(0, 100));
+  }
+  async announceReply(who, channelName, content3) {
+    const clean2 = spoken(who, channelName, content3);
+    const startTurn = this.turn;
+    if (content3.length > 220 && this.state.settings.llmUrl.trim() && this.state.settings.speak) {
+      try {
+        const sentences = new SentenceBuffer();
+        const abort = new AbortController();
+        await llmStream(
+          this.deps.host,
+          this.state.settings,
+          {
+            model: this.state.settings.llmModel || "default",
+            max_tokens: 120,
+            chat_template_kwargs: { enable_thinking: false },
+            messages: [
+              {
+                role: "system",
+                content: "Summarize this incoming Buzz reply out loud in 1 to 2 short plain-text sentences (under 30 words). Start with who replied and in which channel. No markdown."
+              },
+              { role: "user", content: `${who} in #${channelName}:
+${content3.slice(0, 1500)}` }
+            ]
+          },
+          (delta) => {
+            if (this.turn !== startTurn || this.state.hearing) {
+              abort.abort();
+              return;
+            }
+            sentences.push(delta, (s) => this.speaker.speak(s));
+          },
+          abort.signal
+        );
+        if (this.turn === startTurn && !this.state.hearing) {
+          sentences.flush((s) => this.speaker.speak(s));
+        }
+        return;
+      } catch {
+        if (this.turn !== startTurn || this.state.hearing) return;
+      }
+    }
+    if (this.turn === startTurn && !this.state.hearing) this.speaker.speak(clean2);
   }
   async tick() {
     const relay = this.deps.relay();
@@ -7444,41 +9626,18 @@ var Controller = class {
     if (live.length !== this.state.watches.length) {
       saveJson(WATCH_KEY, live);
       this.set({ watches: live });
+      this.syncWatchObserver();
     }
     if (live.length === 0) return;
     this.polling = true;
     try {
-      const since = Math.min(...live.map((w) => w.since)) + 1;
-      const events = await relay.repliesIn(live.map((w) => w.rootId), since);
-      const byRoot = new Map(live.map((w) => [w.rootId, w]));
-      const fresh = [];
-      for (const event of events) {
-        if (event.pubkey === relay.pubkey) continue;
-        const watch = byRoot.get(rootOf(event)) ?? byRoot.get(event.id);
-        if (!watch || event.created_at <= watch.since) continue;
-        fresh.push({ watch, event });
+      if (this.watchObserver) {
+        await this.watchObserver.refresh().catch(() => void 0);
+      } else {
+        const since = Math.min(...live.map((w) => w.since)) + 1;
+        const events = await relay.repliesIn(live.map((w) => w.rootId), since);
+        await this.ingestReplies(relay, events);
       }
-      if (fresh.length === 0) return;
-      const names = await relay.profiles([...new Set(fresh.map((f) => f.event.pubkey))]);
-      const seen = /* @__PURE__ */ new Map();
-      for (const { watch, event } of fresh) {
-        seen.set(watch.rootId, Math.max(seen.get(watch.rootId) ?? 0, event.created_at));
-      }
-      const watches = this.state.watches.map((w) => seen.has(w.rootId) ? { ...w, since: seen.get(w.rootId) } : w);
-      saveJson(WATCH_KEY, watches);
-      this.set({ watches });
-      for (const { watch, event } of fresh.sort((a, b) => a.event.created_at - b.event.created_at)) {
-        const who = names.get(event.pubkey) ?? event.pubkey.slice(0, 8);
-        this.say("app", event.content, {
-          meta: `${who} in ${watch.channelName}`,
-          link: { channelId: watch.channelId, messageId: event.id, rootId: watch.rootId }
-        });
-        this.tracked = this.tracked.map(
-          (t) => t.rootId === watch.rootId ? { ...t, lastReply: event.content.replace(/\s+/g, " ").slice(0, 240) } : t
-        );
-        if (!this.state.listening) this.speaker.speak(spoken(who, watch.channelName, event.content));
-      }
-      saveJson(TRACK_KEY, this.tracked.slice(0, 100));
     } catch {
       return;
     } finally {
@@ -7843,11 +10002,11 @@ function withoutReactions(source, ids) {
 }
 
 // src/markdown.ts
-var URL = /\bhttps?:\/\/[^\s<>()]+[^\s<>().,;:!?'"]/g;
+var URL2 = /\bhttps?:\/\/[^\s<>()]+[^\s<>().,;:!?'"]/g;
 function linkify(h, text3, key) {
   const out = [];
   let last = 0;
-  for (const match of text3.matchAll(URL)) {
+  for (const match of text3.matchAll(URL2)) {
     const at = match.index ?? 0;
     if (at > last) out.push(text3.slice(last, at));
     out.push(h("a", { key: `${key}-${at}`, href: match[0], target: "_blank", rel: "noreferrer" }, match[0]));
@@ -7940,6 +10099,17 @@ var CSS = `
 .bv-dot{width:.5rem;height:.5rem;border-radius:50%;background:var(--text-disabled);flex:none}
 .bv-dot[data-state=online]{background:var(--text-success)}
 .bv-dot[data-state=error]{background:var(--text-danger)}
+.bv-dot[data-state=live]{background:var(--affordance-accent-prominent);animation:bv-pulse 1.2s ease-in-out infinite}
+@keyframes bv-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
+.bv-pill{display:inline-flex;align-items:center;gap:var(--space-2);padding:var(--space-1) var(--space-3);border:1px solid var(--border-standard);border-radius:var(--radius-pill);background:var(--surface-inset)}
+.bv-pill[data-active]{border-color:var(--affordance-accent-prominent)}
+.bv-controls{display:flex;gap:var(--space-2);align-items:stretch}
+.bv-controls>.bv-talk{flex:1;min-width:0}
+.bv-live{display:flex;align-items:center;justify-content:center;gap:var(--space-2);min-height:3.5rem;padding:0 var(--space-4);border:1px solid var(--border-standard);border-radius:var(--radius-container);background:var(--surface-inset);color:var(--text-standard);font:inherit;cursor:pointer;white-space:nowrap;transition:background var(--duration-fast),color var(--duration-fast),border-color var(--duration-fast)}
+.bv-live:hover:not(:disabled){background:var(--affordance-subtle-hover)}
+.bv-live[data-live]{background:var(--affordance-accent-prominent);border-color:transparent;color:var(--text-on-accent)}
+.bv-live:disabled{opacity:.55;cursor:default}
+.bv-turn[data-streaming] .bv-bubble{border:1px dashed var(--border-standard)}
 .bv-scope{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;padding:0 var(--space-panel-inset) var(--space-2);min-width:0}
 .bv-truncate{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bv-log{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:var(--space-3);padding:var(--space-2) var(--space-panel-inset) var(--space-4)}
@@ -8217,7 +10387,7 @@ function createUi(deps) {
   function Turn({ entry }) {
     return h(
       "div",
-      { className: "bv-turn", "data-role": entry.role, "data-bad": entry.bad || void 0 },
+      { className: "bv-turn", "data-role": entry.role, "data-bad": entry.bad || void 0, "data-streaming": entry.streaming || void 0 },
       (entry.meta || entry.link) && h(
         "div",
         { className: "bv-meta text-caption text-subtle" },
@@ -8391,19 +10561,48 @@ function createUi(deps) {
       )
     );
   }
-  function HandsFree({ voice }) {
+  function ActivityBar({ voice }) {
     const word = voice.settings.wakeWord.trim() || "buzz";
-    const label = !voice.handsFree ? "Hands-free off" : voice.hearing ? "Hearing you..." : voice.awake ? "Go ahead" : `Say \u201Chey ${word}\u201D`;
+    const activityText = voice.huddlePaused ? "Paused for Huddle" : voice.activity === "hearing" ? "Hearing you..." : voice.activity === "transcribing" ? "Transcribing..." : voice.activity === "thinking" ? voice.activityDetail || "Thinking..." : voice.activity === "speaking" ? voice.settings.bargeIn && (voice.liveMode || voice.handsFree) ? "Speaking (talk to interrupt)" : "Speaking..." : voice.liveMode ? "Live \xB7 Listening" : voice.handsFree ? voice.awake ? "Go ahead" : `Say \u201Chey ${word}\u201D` : "Hands-free off";
+    const dotState = voice.activity === "hearing" || voice.activity === "speaking" || voice.activity === "thinking" ? "live" : voice.liveMode || voice.handsFree && voice.awake ? "online" : void 0;
+    const canStop = voice.speaking || voice.busy;
     return h(
       "div",
       { className: "bv-row", style: { justifyContent: "space-between" } },
       h(
         "span",
-        { className: "bv-row text-caption text-subtle" },
-        h("span", { className: "bv-dot", "data-state": voice.handsFree ? voice.hearing || voice.awake ? "online" : "idle" : void 0 }),
-        label
+        { className: "bv-pill text-caption text-subtle", "data-active": voice.liveMode || voice.speaking || voice.hearing || void 0 },
+        h("span", { className: "bv-dot", "data-state": dotState }),
+        activityText
       ),
-      h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() })
+      h(
+        "div",
+        { className: "bv-row" },
+        canStop && h(Button, { variant: "subtle", size: "sm", onClick: () => controller.stopSpeaking() }, "Stop"),
+        !voice.liveMode && voice.engine?.runtime && h(
+          "label",
+          { className: "bv-row text-caption text-subtle", style: { cursor: "pointer" } },
+          "Wake word",
+          h(Switch, { label: "Hands-free wake word", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() })
+        )
+      )
+    );
+  }
+  function LiveButton({ voice }) {
+    const disabled = !voice.engine?.runtime || !voice.ready || voice.opening;
+    return h(
+      "button",
+      {
+        type: "button",
+        className: "bv-live text-label",
+        disabled,
+        "data-live": voice.liveMode || void 0,
+        "aria-pressed": voice.liveMode,
+        title: voice.liveMode ? "End Live conversation (\u2318\u21E7L)" : "Start Live conversation \u2014 no wake word, interrupt anytime (\u2318\u21E7L)",
+        onClick: () => controller.toggleLiveMode()
+      },
+      h("span", { className: "bv-dot", "data-state": voice.liveMode ? "live" : void 0 }),
+      voice.liveMode ? "End Live" : "Live"
     );
   }
   function TalkButton({ voice }) {
@@ -8450,13 +10649,14 @@ function createUi(deps) {
   function Talk({ voice }) {
     const [typed, setTyped] = useState("");
     const log = useRef(null);
+    const lastText = voice.log.at(-1)?.text ?? "";
     useEffect(() => {
       if (voice.ready) controller.warmMicrophone();
     }, [voice.ready, voice.settings.microphone]);
     useEffect(() => {
       const node2 = log.current;
       if (node2) node2.scrollTop = node2.scrollHeight;
-    }, [voice.log.length, !!voice.pending]);
+    }, [voice.log.length, lastText.length, !!voice.pending]);
     const level = Math.min(1, voice.level * 3);
     const watching = voice.watches.length;
     return h(
@@ -8469,7 +10669,7 @@ function createUi(deps) {
         watching > 0 && h(
           "span",
           { title: voice.watches.map((w) => `${w.channelName}: ${w.label}`).join("\n") },
-          `${voice.scope ? "\xB7 " : ""}Watching ${watching} ${watching === 1 ? "thread" : "threads"}`
+          `${voice.scope ? "\xB7 " : ""}Watching ${watching} ${watching === 1 ? "thread" : "threads"} (live)`
         )
       ),
       h(
@@ -8478,7 +10678,7 @@ function createUi(deps) {
         !voice.ready && voice.log.length === 0 ? h(Setup, { voice }) : voice.log.length === 0 && !voice.pending ? h(EmptyState, {
           icon: "mic",
           title: "Talk to Buzz",
-          description: "\u201CIn ops, tell build-bot to rerun the deploy.\u201D \u201CAdd a todo in ops for build-bot to rotate the keys.\u201D \u201CHow is work going in ops?\u201D \u201CWhat\u2019s in my inbox?\u201D"
+          description: "Hit Live (\u2318\u21E7L) for natural back-and-forth with barge-in, or hold Talk: \u201CWhat\u2019s going on in ops?\u201D \u201CTell build-bot to rerun the deploy.\u201D \u201CWhat\u2019s in my inbox?\u201D"
         }) : null,
         voice.log.map((entry) => h(Turn, { key: entry.id, entry })),
         voice.pending && h(Confirm, { voice })
@@ -8487,12 +10687,17 @@ function createUi(deps) {
         "div",
         { className: "bv-footer" },
         h("div", { className: "bv-meter", "aria-hidden": true }, h("span", { style: { width: `${Math.round(level * 100)}%` } })),
-        voice.ready && voice.engine?.runtime && h(HandsFree, { voice }),
-        h(TalkButton, { voice }),
+        (voice.ready || voice.speaking || voice.busy) && h(ActivityBar, { voice }),
+        h(
+          "div",
+          { className: "bv-controls" },
+          voice.engine?.runtime && h(LiveButton, { voice }),
+          h(TalkButton, { voice })
+        ),
         h(
           "p",
           { className: `bv-status text-caption ${voice.statusBad ? "text-danger" : "text-subtle"}`, role: voice.statusBad ? "alert" : "status" },
-          voice.status || (voice.ready ? "Or press \u2318\u21E7Space anywhere in Buzz, \u2318\u21E7H for hands-free" : "")
+          voice.status || (voice.ready ? "\u2318\u21E7L Live \xB7 \u2318\u21E7Space Push to talk \xB7 \u2318\u21E7H Wake word \xB7 \u2318\u21E7. Stop" : "")
         ),
         h(
           "form",
@@ -8508,10 +10713,9 @@ function createUi(deps) {
             "aria-label": "Type a command",
             placeholder: "Or type what you would say",
             value: typed,
-            disabled: voice.busy,
             onChange: (event) => setTyped(event.target.value)
           }),
-          h(Button, { type: "submit", variant: "subtle", disabled: voice.busy || !typed.trim() }, "Send")
+          h(Button, { type: "submit", variant: "subtle", disabled: !typed.trim() }, "Send")
         )
       )
     );
@@ -9090,6 +11294,99 @@ function createUi(deps) {
       value && !devices.some((d) => d.id === value) && h("option", { value }, "Saved microphone (not connected)")
     );
   }
+  function SttApiForm({ settings }) {
+    const [draft, setDraft] = useState({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey });
+    const [saved, setSaved] = useState(false);
+    useEffect(() => setDraft({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey }), [settings.sttUrl, settings.sttModel, settings.sttKey]);
+    const dirty = draft.sttUrl !== settings.sttUrl || draft.sttModel !== settings.sttModel || draft.sttKey !== settings.sttKey;
+    const invalid = draft.sttUrl.trim() !== "" && !/^https?:\/\/[^\s]+$/i.test(draft.sttUrl.trim());
+    const set = (key) => (event) => {
+      setSaved(false);
+      setDraft({ ...draft, [key]: event.target.value });
+    };
+    return h(
+      "form",
+      {
+        className: "bv-form",
+        noValidate: true,
+        onSubmit: (event) => {
+          event.preventDefault();
+          if (invalid) return;
+          controller.updateSettings({ sttUrl: draft.sttUrl.trim(), sttModel: draft.sttModel.trim() || "whisper-1", sttKey: draft.sttKey.trim() });
+          setSaved(true);
+        }
+      },
+      h(
+        Field,
+        { label: "STT Endpoint", description: "OpenAI-compatible /v1/audio/transcriptions base URL (whisper.cpp, Speaches, faster-whisper, Groq, OpenAI)." },
+        h(Input, { value: draft.sttUrl, onChange: set("sttUrl"), placeholder: "http://localhost:8000/v1", spellCheck: false, autoCapitalize: "off", autoCorrect: "off" })
+      ),
+      invalid && h("p", { className: "buzz-field-error text-caption text-danger", role: "alert", style: { margin: 0 } }, "Enter a URL starting with http:// or https://."),
+      h(Field, { label: "STT Model" }, h(Input, { value: draft.sttModel, onChange: set("sttModel"), placeholder: "whisper-1", spellCheck: false })),
+      h(Field, { label: "API key", description: "Optional. Stored on this device only." }, h(Input, { type: "password", value: draft.sttKey, onChange: set("sttKey"), autoComplete: "off" })),
+      h(
+        "div",
+        { className: "bv-row-end" },
+        saved && !dirty && h("span", { className: "text-caption text-subtle", style: { marginRight: "auto" } }, "Saved"),
+        h(Button, { variant: "subtle", disabled: !dirty, onClick: () => setDraft({ sttUrl: settings.sttUrl, sttModel: settings.sttModel, sttKey: settings.sttKey }) }, "Discard"),
+        h(Button, { type: "submit", variant: "prominent", disabled: !dirty || invalid }, "Save")
+      )
+    );
+  }
+  function TtsApiForm({ settings }) {
+    const [draft, setDraft] = useState({
+      ttsUrl: settings.ttsUrl,
+      ttsModel: settings.ttsModel,
+      ttsVoice: settings.ttsVoice,
+      ttsKey: settings.ttsKey
+    });
+    const [saved, setSaved] = useState(false);
+    useEffect(
+      () => setDraft({ ttsUrl: settings.ttsUrl, ttsModel: settings.ttsModel, ttsVoice: settings.ttsVoice, ttsKey: settings.ttsKey }),
+      [settings.ttsUrl, settings.ttsModel, settings.ttsVoice, settings.ttsKey]
+    );
+    const dirty = draft.ttsUrl !== settings.ttsUrl || draft.ttsModel !== settings.ttsModel || draft.ttsVoice !== settings.ttsVoice || draft.ttsKey !== settings.ttsKey;
+    const invalid = draft.ttsUrl.trim() !== "" && !/^https?:\/\/[^\s]+$/i.test(draft.ttsUrl.trim());
+    const set = (key) => (event) => {
+      setSaved(false);
+      setDraft({ ...draft, [key]: event.target.value });
+    };
+    return h(
+      "form",
+      {
+        className: "bv-form",
+        noValidate: true,
+        onSubmit: (event) => {
+          event.preventDefault();
+          if (invalid) return;
+          controller.updateSettings({
+            ttsUrl: draft.ttsUrl.trim(),
+            ttsModel: draft.ttsModel.trim() || "kokoro",
+            ttsVoice: draft.ttsVoice.trim() || "af_heart",
+            ttsKey: draft.ttsKey.trim()
+          });
+          setSaved(true);
+        }
+      },
+      h(
+        Field,
+        { label: "TTS Endpoint", description: "OpenAI-compatible /v1/audio/speech base URL (Kokoro-FastAPI, Speaches, Piper HTTP, Orpheus, OpenAI)." },
+        h(Input, { value: draft.ttsUrl, onChange: set("ttsUrl"), placeholder: "http://localhost:8880/v1", spellCheck: false, autoCapitalize: "off", autoCorrect: "off" })
+      ),
+      invalid && h("p", { className: "buzz-field-error text-caption text-danger", role: "alert", style: { margin: 0 } }, "Enter a URL starting with http:// or https://."),
+      h(Field, { label: "TTS Model" }, h(Input, { value: draft.ttsModel, onChange: set("ttsModel"), placeholder: "kokoro", spellCheck: false })),
+      h(Field, { label: "Voice" }, h(Input, { value: draft.ttsVoice, onChange: set("ttsVoice"), placeholder: "af_heart", spellCheck: false })),
+      h(Field, { label: "API key", description: "Optional. Stored on this device only." }, h(Input, { type: "password", value: draft.ttsKey, onChange: set("ttsKey"), autoComplete: "off" })),
+      h(
+        "div",
+        { className: "bv-row-end" },
+        saved && !dirty && h("span", { className: "text-caption text-subtle", style: { marginRight: "auto" } }, "Saved"),
+        h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test"),
+        h(Button, { variant: "subtle", disabled: !dirty, onClick: () => setDraft({ ttsUrl: settings.ttsUrl, ttsModel: settings.ttsModel, ttsVoice: settings.ttsVoice, ttsKey: settings.ttsKey }) }, "Discard"),
+        h(Button, { type: "submit", variant: "prominent", disabled: !dirty || invalid }, "Save")
+      )
+    );
+  }
   function SettingsCard() {
     const voice = useVoice();
     const settings = voice.settings;
@@ -9100,37 +11397,79 @@ function createUi(deps) {
       "section",
       { className: "bv-settings", "aria-labelledby": "bv-settings-title" },
       h("style", null, CSS),
-      h(Header, { title: "Buzz Voice", subtitle: "Talk to Buzz and find threads by emoji." }),
-      h(Header, { inline: true, title: "Speech to text" }),
+      h(Header, { title: "Buzz Voice", subtitle: "Live reactive voice assistant with pluggable LLM, STT, and TTS." }),
+      h(Header, { inline: true, title: "Live conversation & reactivity" }),
       h(
         Group,
         null,
         h(Row, {
-          title: "Speech engine",
-          subtitle: h("span", { className: voice.engineError ? "text-danger" : void 0 }, status),
-          trailing: h(
-            Button,
-            {
-              variant: ready ? "subtle" : "prominent",
-              size: "sm",
-              loading: !!voice.installing,
-              onClick: () => void (ready ? controller.refreshEngine() : controller.install())
-            },
-            ready ? "Check" : "Install"
-          )
+          title: "Interrupt while speaking (barge-in)",
+          subtitle: "Keep listening during playback so talking immediately cuts off speech and starts a new turn.",
+          trailing: h(Switch, { label: "Interrupt while speaking", checked: settings.bargeIn, onChange: (next) => controller.updateSettings({ bargeIn: next }) })
+        }),
+        h(Row, {
+          title: "Confirm before sending",
+          subtitle: "Show an editable card before posting messages or editing todos. Turn off for instant hands-free sending.",
+          trailing: h(Switch, { label: "Confirm before sending", checked: settings.confirmBeforeSend, onChange: (next) => controller.updateSettings({ confirmBeforeSend: next }) })
+        }),
+        h(Row, {
+          title: "Subtle audio cues",
+          subtitle: "Play a soft tone when Live starts or when you interrupt.",
+          trailing: h(Switch, { label: "Subtle audio cues", checked: settings.audioCues, onChange: (next) => controller.updateSettings({ audioCues: next }) })
+        }),
+        h(Row, {
+          title: "Pause before replying (ms)",
+          subtitle: "Silence duration in Live mode before sending your utterance. Lower is snappier (350\u2013500 ms recommended).",
+          trailing: h(Input, {
+            type: "number",
+            "aria-label": "VAD silence milliseconds",
+            min: 200,
+            max: 1500,
+            step: 50,
+            value: settings.vadSilenceMs,
+            style: { width: "6.5rem" },
+            onChange: (e) => {
+              const v = Number(e.target.value);
+              if (Number.isFinite(v) && v >= 200 && v <= 1500) controller.updateSettings({ vadSilenceMs: v });
+            }
+          })
         })
       ),
+      h(Header, { inline: true, title: "Speech to text (STT)" }),
       h(
         Group,
         null,
         h(Row, {
-          title: "Fast speech and hands-free",
-          subtitle: engine?.runtime ? "Ready. Whisper stays loaded between sentences, and hands-free listens for the wake word." : "Keeps whisper loaded so replies start sooner, and turns on hands-free. Needs python3; installs into the model folder.",
-          trailing: engine?.runtime ? h(Switch, { label: "Hands-free", checked: voice.handsFree, onChange: () => controller.toggleHandsFree() }) : h(Button, { variant: "subtle", size: "sm", loading: !!voice.installing, disabled: !ready, onClick: () => void controller.install() }, "Install")
+          title: "STT backend",
+          subtitle: "Local Whisper runs offline; OpenAI-compatible API uses your own LAN or cloud STT server while keeping local Silero VAD for instant turn detection.",
+          trailing: h(Segmented, {
+            label: "STT backend",
+            compact: true,
+            value: settings.sttBackend,
+            options: [
+              ["local", "Local"],
+              ["openai", "API"]
+            ],
+            onChange: (v) => controller.updateSettings({ sttBackend: v })
+          })
+        }),
+        h(Row, {
+          title: "Fast speech runtime (Silero VAD)",
+          subtitle: engine?.runtime ? "Ready. Powers Live mode, barge-in, wake-word hands-free, and instant local decoding." : "Required for Live mode and hands-free. Needs python3; installs sherpa-onnx + Silero VAD into the model folder.",
+          trailing: engine?.runtime ? h(Switch, { label: "Live mode", checked: voice.liveMode, onChange: () => controller.toggleLiveMode() }) : h(
+            Button,
+            {
+              variant: "prominent",
+              size: "sm",
+              loading: !!voice.installing,
+              onClick: () => void (settings.sttBackend === "openai" ? controller.installRuntimeOnly() : controller.install())
+            },
+            "Install"
+          )
         }),
         h(Row, {
           title: "Wake word",
-          subtitle: `Say \u201Chey ${settings.wakeWord.trim() || "buzz"}, ...\u201D to give a command hands-free.`,
+          subtitle: `Used in wake-word hands-free mode: say \u201Chey ${settings.wakeWord.trim() || "buzz"}, ...\u201D.`,
           trailing: h(Input, {
             "aria-label": "Wake word",
             value: settings.wakeWord,
@@ -9140,37 +11479,136 @@ function createUi(deps) {
           })
         })
       ),
-      h(Group, { layout: "form" }, h(SpeechForm, { settings })),
+      settings.sttBackend === "openai" ? h(Group, { layout: "form" }, h(SttApiForm, { settings })) : h(
+        Fragment,
+        null,
+        h(
+          Group,
+          null,
+          h(Row, {
+            title: "Local Whisper engine",
+            subtitle: h("span", { className: voice.engineError ? "text-danger" : void 0 }, status),
+            trailing: h(
+              Button,
+              {
+                variant: ready ? "subtle" : "prominent",
+                size: "sm",
+                loading: !!voice.installing,
+                onClick: () => void (ready ? controller.refreshEngine() : controller.install())
+              },
+              ready ? "Check" : "Install"
+            )
+          })
+        ),
+        h(Group, { layout: "form" }, h(SpeechForm, { settings }))
+      ),
       h(Header, {
         inline: true,
         title: "Language model",
-        subtitle: "Writes messages and reads channels back. Routing uses your Decisions API provider when one is on."
+        subtitle: "Streams conversational replies and Buzz tool calls in Live mode. Any OpenAI-compatible endpoint works."
       }),
       h(LlmForm, { settings }),
-      h(Header, { inline: true, title: "Microphone" }),
-      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
-      h(Header, { inline: true, title: "Spoken replies" }),
+      h(Header, { inline: true, title: "Spoken replies (TTS)" }),
       h(
         Group,
         null,
         h(Row, {
           title: "Read replies out loud",
-          subtitle: "Answers and new replies in watched threads.",
+          subtitle: "Streams spoken answers sentence-by-sentence through WebAudio for echo cancellation and barge-in.",
           trailing: h(Switch, { label: "Read replies out loud", checked: settings.speak, onChange: (next) => controller.updateSettings({ speak: next }) })
         }),
         h(Row, {
-          title: "Voice",
-          subtitle: "Download better voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
+          title: "TTS backend",
+          subtitle: "Use System voice, a local sherpa-onnx neural voice (Kokoro / Piper), or any OpenAI-compatible /v1/audio/speech server.",
+          trailing: h(Segmented, {
+            label: "TTS backend",
+            value: settings.ttsBackend,
+            options: [
+              ["system", "System"],
+              ["local", "Local"],
+              ["openai", "API"]
+            ],
+            onChange: (v) => controller.updateSettings({ ttsBackend: v })
+          })
+        }),
+        h(Row, {
+          title: "Speaking speed",
+          subtitle: "1.0 is normal speed (0.5 to 2.0).",
+          trailing: h(Input, {
+            type: "number",
+            "aria-label": "Speaking speed",
+            min: 0.5,
+            max: 2,
+            step: 0.1,
+            value: settings.ttsSpeed,
+            style: { width: "6rem" },
+            onChange: (e) => {
+              const v = Number(e.target.value);
+              if (Number.isFinite(v) && v >= 0.5 && v <= 2) controller.updateSettings({ ttsSpeed: v });
+            }
+          })
+        }),
+        settings.ttsBackend === "system" && h(Row, {
+          title: "System voice",
+          subtitle: "Download enhanced voices in System Settings > Accessibility > Spoken Content > Manage Voices, then refresh.",
           trailing: h(VoicePicker, { value: settings.voice })
-        })
+        }),
+        settings.ttsBackend === "local" && h(
+          Fragment,
+          null,
+          h(Row, {
+            title: "Local neural voice model",
+            subtitle: engine?.ttsModel ? `Installed (${settings.localTtsModel}). Stays loaded in memory for fast offline speech.` : `Not installed yet. Downloads ${settings.localTtsModel} from sherpa-onnx releases.`,
+            trailing: h(
+              "div",
+              { className: "bv-row" },
+              h(
+                "select",
+                {
+                  "aria-label": "Local TTS model",
+                  "data-buzz-ui": "",
+                  className: "buzz-input",
+                  "data-size": "md",
+                  value: settings.localTtsModel,
+                  onChange: (e) => controller.updateSettings({ localTtsModel: e.target.value })
+                },
+                h("option", { value: "kokoro-en-v0_19" }, "Kokoro English (11 voices)"),
+                h("option", { value: "vits-piper-en_US-lessac-medium" }, "Piper Lessac (fast, light)"),
+                !["kokoro-en-v0_19", "vits-piper-en_US-lessac-medium"].includes(settings.localTtsModel) && h("option", { value: settings.localTtsModel }, settings.localTtsModel)
+              ),
+              !engine?.ttsModel && h(Button, { variant: "prominent", size: "sm", loading: !!voice.installing, onClick: () => void controller.installLocalTts() }, "Install"),
+              h(Button, { variant: "subtle", size: "sm", onClick: () => controller.testVoice() }, "Test")
+            )
+          }),
+          h(Row, {
+            title: "Speaker ID",
+            subtitle: "For multi-speaker models like Kokoro (0\u201310).",
+            trailing: h(Input, {
+              type: "number",
+              "aria-label": "Speaker ID",
+              min: 0,
+              max: 99,
+              value: settings.localTtsSpeaker,
+              style: { width: "5.5rem" },
+              onChange: (e) => {
+                const v = Number(e.target.value);
+                if (Number.isInteger(v) && v >= 0) controller.updateSettings({ localTtsSpeaker: v });
+              }
+            })
+          })
+        )
       ),
+      settings.ttsBackend === "openai" && h(Group, { layout: "form" }, h(TtsApiForm, { settings })),
+      h(Header, { inline: true, title: "Microphone" }),
+      h(Group, null, h(Row, { title: "Input", subtitle: "The microphone stays open while you use Buzz Voice, so talking starts instantly. It closes after 10 idle minutes.", trailing: h(MicrophonePicker, { value: settings.microphone }) })),
       h(Header, { inline: true, title: "Shortcuts" }),
       h(
         Group,
         null,
-        h(Row, { title: "Start or stop talking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7Space") }),
-        h(Row, { title: "Stop speaking", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7.") }),
-        h(Row, { title: "Hands-free on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7H") })
+        h(Row, { title: "Live conversation on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7L") }),
+        h(Row, { title: "Start or stop talking (push to talk)", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7Space") }),
+        h(Row, { title: "Stop speaking / interrupt", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7.") }),
+        h(Row, { title: "Wake-word hands-free on or off", trailing: h("kbd", { className: "bv-kbd text-caption" }, "\u2318\u21E7H") })
       )
     );
   }
@@ -9209,6 +11647,21 @@ function apply(ctx) {
     community: () => scopeOf(ctx.relay.snapshot())?.communityOrigin
   });
   ctx.effect(() => controller.start(), "buzz-voice controller");
+  ctx.effect(() => ctx.relay.subscribe(() => controller.onRelayChanged()), "buzz-voice relay sync");
+  ctx.effect(() => {
+    const huddleStatus = optional(ctx, "huddleStatus");
+    if (!huddleStatus?.subscribe || !huddleStatus?.snapshot) return void 0;
+    const sync = () => {
+      try {
+        const snap = huddleStatus.snapshot();
+        const active = !!(snap?.active || snap?.inHuddle || snap?.state === "connected" || snap?.channelId);
+        controller.setHuddleActive(active);
+      } catch {
+      }
+    };
+    sync();
+    return huddleStatus.subscribe(sync);
+  }, "buzz-voice huddle auto-pause");
   const { Page, SettingsCard } = createUi({
     React: ctx.react,
     controller,
@@ -9218,6 +11671,13 @@ function apply(ctx) {
   });
   ctx.pages.register({ id: "main", title: "Buzz Voice", primary: true, component: Page });
   ctx.settingsCards.register({ id: "settings", title: "Buzz Voice", component: SettingsCard, personal: true });
+  ctx.shortcuts.register({
+    id: "live",
+    title: "Buzz Voice: Live conversation on or off",
+    binding: { key: "l", mod: true, shift: true },
+    allowInEditable: true,
+    run: () => controller.toggleLiveMode()
+  });
   ctx.shortcuts.register({
     id: "talk",
     title: "Buzz Voice: start or stop talking",
@@ -9236,7 +11696,7 @@ function apply(ctx) {
   });
   ctx.shortcuts.register({
     id: "stop-speaking",
-    title: "Buzz Voice: stop speaking",
+    title: "Buzz Voice: stop speaking / interrupt",
     binding: { key: ".", mod: true, shift: true },
     allowInEditable: true,
     run: () => controller.stopSpeaking()
